@@ -1,4 +1,4 @@
 interface:
-  display_name: "Skill Manager"
+  display_name: "Skills Manager"
   short_description: "Manage skill libraries, scopes, groups, and migrations"
-  default_prompt: "Use $skill-manager to install or organize my Codex skills safely."
+  default_prompt: "Use $skills-manager to install or organize my Codex skills safely."

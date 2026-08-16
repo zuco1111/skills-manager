@@ -1,9 +1,9 @@
 ---
-name: skill-manager
-description: Install and manage standalone Codex Skills—not plugins or bundled/system/plugin-cache Skills—through a central SkillsLibrary with mandatory global-or-project scope selection. Use when users ask to install, import, migrate, list, classify, group, update, repair, expose, unlink, or remove Skills; preinstall project Skills before a project exists; install named Skill groups such as "backend skills"; or ask about Skill Manager features and documentation. Store canonical copies in SkillsLibrary and expose them with symlinks. Use skill-creator, not this Skill, to author Skill content.
+name: skills-manager
+description: Install and manage standalone Codex Skills—not plugins or bundled/system/plugin-cache Skills—through a central SkillsLibrary with mandatory global-or-project scope selection. Use when users ask to install, import, migrate, list, classify, group, update, repair, expose, unlink, or remove Skills; preinstall project Skills before a project exists; install named Skill groups such as "backend skills"; or ask about Skills Manager features and documentation. Store canonical copies in SkillsLibrary and expose them with symlinks. Use skill-creator, not this Skill, to author Skill content.
 ---
 
-# Skill Manager
+# Skills Manager
 
 Manage canonical Skill copies in a central library and expose them through scoped directory symlinks. Keep the workflow interactive at decision points and deterministic for filesystem operations.
 
@@ -28,8 +28,8 @@ Read [references/user-guide.md](references/user-guide.md) completely when the us
 ## Start every workflow
 
 1. Resolve this Skill's actual directory from the active Skill path.
-2. Run `python3 scripts/skill_manager.py status`.
-3. If the canonical library or global `skill-manager` link is missing, follow **Self-bootstrap** before managing other Skills.
+2. Run `python3 scripts/skills_manager.py status`.
+3. If the canonical library or global `skills-manager` link is missing, follow **Self-bootstrap** before managing other Skills.
 4. If `migration_status` is `not-asked`, ask whether the user wants to scan existing user-level Skills for migration. Record the answer with `mark-migration`; do not scan before consent.
 5. Identify the requested operation and follow the relevant workflow below.
 
@@ -37,11 +37,11 @@ Read [references/user-guide.md](references/user-guide.md) completely when the us
 
 Use self-bootstrap when this Skill was installed outside the canonical library.
 
-1. Explain that the real copy will live at `$HOME/SkillsLibrary/skills/skill-manager` and the global entry will be a symlink.
+1. Explain that the real copy will live at `$HOME/SkillsLibrary/skills/skills-manager` and the global entry will be a symlink.
 2. Show a dry run, passing the currently active Skill folder explicitly:
 
    ```bash
-   python3 scripts/skill_manager.py bootstrap --source <active-skill-folder>
+   python3 scripts/skills_manager.py bootstrap --source <active-skill-folder>
    ```
 
 3. After confirmation, rerun with `--apply`.
@@ -61,21 +61,21 @@ The bootstrap command must be idempotent. It must validate the copied Skill befo
 4. Validate the canonical directory:
 
    ```bash
-   python3 scripts/skill_manager.py validate <canonical-skill-directory>
+   python3 scripts/skills_manager.py validate <canonical-skill-directory>
    ```
 
 5. If a destination exists, show the exposure plan:
 
    ```bash
-   python3 scripts/skill_manager.py expose <skill-name> --scope global
-   python3 scripts/skill_manager.py expose <skill-name> --scope project --project <root>
+   python3 scripts/skills_manager.py expose <skill-name> --scope global
+   python3 scripts/skills_manager.py expose <skill-name> --scope project --project <root>
    ```
 
 6. After confirmation, repeat the applicable exposure command with `--apply`; exposure records the selected scope. If the project does not exist yet, skip exposure and record the user's classification instead:
 
    ```bash
-   python3 scripts/skill_manager.py set-scope <skill-name> --scope project
-   python3 scripts/skill_manager.py set-scope <skill-name> --scope project --apply
+   python3 scripts/skills_manager.py set-scope <skill-name> --scope project
+   python3 scripts/skills_manager.py set-scope <skill-name> --scope project --apply
    ```
 
    The installation is complete once the canonical copy is valid and its scope is marked.
@@ -120,7 +120,7 @@ Only enter this workflow after explicit consent.
 1. Discover user-level candidates:
 
    ```bash
-   python3 scripts/skill_manager.py discover
+   python3 scripts/skills_manager.py discover
    ```
 
 2. Include project candidates only when the user supplies project roots with `--project`.
@@ -152,8 +152,8 @@ Never silently merge Skill folders. Do not delete a symlink target when unlinkin
 
 ## Script contract
 
-Use `scripts/skill_manager.py` for deterministic filesystem work. Commands are read-only by default where a mutation is possible and require `--apply` to change state. The script uses only the Python standard library, enforces the official frontmatter constraints needed for installation, writes state atomically, stages canonical replacements, retains recoverable backups, and rolls back newly created links, removed links, and moved canonical or group paths when a transaction fails.
+Use `scripts/skills_manager.py` for deterministic filesystem work. Commands are read-only by default where a mutation is possible and require `--apply` to change state. The script uses only the Python standard library, enforces the official frontmatter constraints needed for installation, writes state atomically, stages canonical replacements, retains recoverable backups, and rolls back newly created links, removed links, and moved canonical or group paths when a transaction fails.
 
-After modifying the script, run `python3 scripts/test_skill_manager.py` and the bundled `skill-creator` `quick_validate.py` before accepting the change.
+After modifying the script, run `python3 scripts/test_skills_manager.py` and the bundled `skill-creator` `quick_validate.py` before accepting the change.
 
-Run `python3 scripts/skill_manager.py --help` for the command index.
+Run `python3 scripts/skills_manager.py --help` for the command index.

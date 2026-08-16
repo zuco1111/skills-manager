@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated regression tests for skill_manager.py."""
+"""Isolated regression tests for skills_manager.py."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ from pathlib import Path
 from unittest import mock
 
 
-SCRIPT_PATH = Path(__file__).with_name("skill_manager.py")
-SPEC = importlib.util.spec_from_file_location("skill_manager_under_test", SCRIPT_PATH)
+SCRIPT_PATH = Path(__file__).with_name("skills_manager.py")
+SPEC = importlib.util.spec_from_file_location("skills_manager_under_test", SCRIPT_PATH)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError(f"Cannot load {SCRIPT_PATH}")
 manager = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(manager)
 
 
-class SkillManagerTests(unittest.TestCase):
+class SkillsManagerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="skill-manager-test-")
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="skills-manager-test-")
         self.root = Path(self.temp_dir.name)
         self.original_global_skills_dir = manager.GLOBAL_SKILLS_DIR
         manager.GLOBAL_SKILLS_DIR = self.root / "home" / ".agents" / "skills"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic filesystem operations for the skill-manager Skill.
+"""Deterministic filesystem operations for the skills-manager Skill.
 
 Mutating commands are dry-runs unless --apply is present. The script deliberately
 does not decide installation scope or prompt users; SKILL.md owns those choices.
@@ -218,7 +218,7 @@ class Library:
         self.root = lexical_path(root)
         self.skills = self.root / "skills"
         self.groups = self.root / "groups"
-        self.internal = self.root / ".skill-manager"
+        self.internal = self.root / ".skills-manager"
         self.backups = self.internal / "backups"
         self.staging = self.internal / "staging"
         self.state_file = self.internal / "state.json"
@@ -491,8 +491,8 @@ def cmd_init(args: argparse.Namespace, lib: Library) -> None:
 
 def cmd_status(args: argparse.Namespace, lib: Library) -> None:
     state = lib.load_state()
-    canonical = lib.skill_path("skill-manager")
-    global_link = GLOBAL_SKILLS_DIR / "skill-manager"
+    canonical = lib.skill_path("skills-manager")
+    global_link = GLOBAL_SKILLS_DIR / "skills-manager"
     skills = list_canonical_skills(lib)
     global_skills = [name for name in skills if state["skill_scopes"].get(name) == "global"]
     project_skills = [name for name in skills if state["skill_scopes"].get(name) == "project"]
@@ -786,7 +786,7 @@ def cmd_migrate(args: argparse.Namespace, lib: Library) -> None:
 
 def cmd_bootstrap(args: argparse.Namespace, lib: Library) -> None:
     source = lexical_path(args.source) if args.source else lexical_path(Path(__file__).parent.parent)
-    payload = migrate_core(lib, source, "global", None, args.apply, expected_name="skill-manager")
+    payload = migrate_core(lib, source, "global", None, args.apply, expected_name="skills-manager")
     payload["action"] = "bootstrap"
     if args.apply:
         payload["next_step"] = "Use the canonical Skill on the next turn; restart Codex if it does not appear."
@@ -1182,8 +1182,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_apply(migrate)
     migrate.set_defaults(func=cmd_migrate)
 
-    bootstrap = sub.add_parser("bootstrap", help="Relocate and globally link skill-manager itself")
-    bootstrap.add_argument("--source", help="Currently active skill-manager directory")
+    bootstrap = sub.add_parser("bootstrap", help="Relocate and globally link skills-manager itself")
+    bootstrap.add_argument("--source", help="Currently active skills-manager directory")
     add_apply(bootstrap)
     bootstrap.set_defaults(func=cmd_bootstrap)
 
