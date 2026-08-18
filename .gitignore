@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.skills-manager/
+.env
+.env.*
+*.pem
+*.key

@@ -5,13 +5,14 @@
 1. Purpose and boundaries
 2. Library layout
 3. Installation scopes
-4. First-run self-bootstrap and migration
+4. First-run initialization and migration
 5. Installing and importing Skills
-6. Groups
-7. Updates, unlinking, removal, and repair
-8. Safety behavior
-9. Examples
-10. Current limitations
+6. Functional-overlap checks
+7. Groups
+8. Updates, unlinking, removal, and repair
+9. Safety behavior
+10. Examples
+11. Current limitations
 
 ## 1. Purpose and boundaries
 
@@ -25,12 +26,13 @@ It is responsible for:
 - creating scoped directory symlinks;
 - preinstalling project-level Skills before a project exists;
 - optionally migrating existing user-level Skills after consent;
+- checking staged and managed Skills for functional overlap that could cause ambiguous routing;
 - defining and installing named groups of Skills;
 - validating, updating, unlinking, removing, and repairing managed Skills.
 
 It does not author the substantive instructions of a new Skill. Use `skill-creator` for authoring, then use Skills Manager for placement and scope.
 
-Skills Manager is a Skill-only policy. It does not install a lifecycle Hook, so it cannot intercept an installation performed completely outside a Codex conversation or force itself to run immediately after another installer finishes. Within a Skills Manager workflow, the scope question is mandatory.
+Skills Manager is a Skill-only policy and does not install a lifecycle Hook. The Codex `skill-installer` workflow gives a brief initialization notice after installing Skills Manager. Independently, the first Skills Manager invocation checks the existing canonical-copy and global-link status fields and explicitly tells the user to initialize before use when either check fails. Within a Skills Manager workflow, the scope question is mandatory.
 
 ## 2. Library layout
 
@@ -52,7 +54,7 @@ SkillsLibrary/
 
 - `skills/` contains canonical Skill directories. Each directory contains its own `SKILL.md`.
 - `groups/` contains YAML manifests that refer to canonical Skill names.
-- `.skills-manager/` contains atomic runtime state, staging data, and recoverable backups.
+- `.skills-manager/` contains atomic runtime state, staging data, recoverable backups, and the overlap-check preference and initial-scan marker.
 
 Skills Manager does not initialize Git or ask whether to initialize Git during normal setup. Existing Git metadata is preserved. Git is initialized or modified only on explicit request.
 
@@ -110,9 +112,9 @@ The marker—not the presence or absence of a symlink—is the classification so
 
 A batch or group asks for scope once and applies it to every member. If project-level is chosen with no available root, all canonical members are installed, validated, and marked `project` in one transaction, with no links or separate pending-state records. Mixed scopes or destinations are handled only when explicitly requested. Every member is preflighted before any mutation.
 
-## 4. First-run self-bootstrap and migration
+## 4. First-run initialization and migration
 
-### Self-bootstrap
+### Initialization
 
 The preferred installation puts the canonical Skills Manager directory directly at:
 
@@ -127,13 +129,15 @@ $HOME/.agents/skills/skills-manager
     -> $HOME/SkillsLibrary/skills/skills-manager
 ```
 
-If a conventional installer places Skills Manager elsewhere, the first invocation can relocate it safely. The bootstrap workflow validates a staged copy, preserves the former installation in a recoverable backup, creates the global link, verifies it, and rolls back on failure.
+If a conventional installer places Skills Manager elsewhere, the first invocation clearly reports that the Skill must be initialized before use and offers to do so. The initialization workflow validates a staged copy, preserves the former installation in a recoverable backup, creates the global link, verifies it, and rolls back on failure.
 
-Because Skills Manager does not use a Hook, this fallback starts on its first invocation rather than immediately after an external installer exits.
+Because Skills Manager does not use a Hook, the installation-time notice comes from the installing Agent's completion message. Initialization itself starts on the first Skills Manager invocation, which checks the canonical copy and global link again before doing other work.
+
+After initialization, Skills Manager performs one functional-overlap scan across the canonical inventory unless the user disabled the check. The script reports broad candidates; the Agent completes the semantic review before recording the initial scan as done. Existing libraries upgraded to this behavior receive the same one-time scan.
 
 ### Existing Skill migration
 
-The first invocation asks whether the user wants to scan existing user-level Skills. Nothing is scanned or migrated until the user agrees.
+After initialization, the first invocation asks whether the user wants to scan existing user-level Skills. Nothing is scanned or migrated until the user agrees.
 
 Default discovery is limited to:
 
@@ -145,6 +149,8 @@ ${CODEX_HOME:-$HOME/.codex}/skills
 Project directories are included only when the user explicitly supplies them. Bundled `.system` Skills, administrator Skills, and plugin caches are excluded by default. Skills Manager never searches the entire home directory or filesystem for projects.
 
 A declined onboarding prompt is recorded so it is not repeated automatically. The user can still request migration later.
+
+Once the user agrees to migrate, selects the candidates, and provides each required scope and project destination, Skills Manager dry-runs every selected item. It immediately applies every conflict-free item without asking the user to confirm the same plan again. If some items conflict, the conflict-free items still migrate; only the conflicting items and their safe resolution choices are sent back for confirmation. Resolving one conflict does not trigger reconfirmation of the complete migration set.
 
 ## 5. Installing and importing Skills
 
@@ -159,16 +165,68 @@ The normal sequence is:
 
 1. Ask global or project-level.
 2. For project-level, ask whether a project or module root exists now. Ask for its path only when it does; otherwise install only to the canonical library.
-3. Place the completed Skill under `SkillsLibrary/skills/`.
+3. Stage a remote Skill outside the canonical destination, or identify the completed local, authored, import, or migration directory.
 4. Validate `SKILL.md`, `name`, `description`, and directory naming.
-5. Show either the intended symlink or the library-only installation plus `project` scope marker.
-6. Apply only after confirmation. A successful exposure records its selected scope automatically; a library-only project installation uses `set-scope --scope project`.
+5. Run the overlap candidate scan and let the Agent complete the semantic review before adopting, promoting, migrating, or exposing the Skill.
+6. Place the approved Skill under `SkillsLibrary/skills/`.
+7. Show either the intended symlink or the library-only installation plus `project` scope marker.
+8. Apply only after confirmation. A successful exposure records its selected scope automatically; a library-only project installation uses `set-scope --scope project`.
 
 If a canonical name already exists, Skills Manager does not overwrite or merge it. It offers the safe choices described in the conflict report.
 
 Installing a single Skill does not trigger a group-membership question. The Skill is added to a group only when the user explicitly requests that action.
 
-## 6. Groups
+For a batch, pass every staged or local candidate to one scan and review all reported pairs together. Apply the same check to selected migration/import directories before the first mutation.
+
+## 6. Functional-overlap checks
+
+Functional overlap is enabled by default. It detects likely routing conflicts, not byte-for-byte copies or similar folder contents.
+
+Run the one-time library scan with:
+
+```bash
+python3 scripts/skills_manager.py overlap scan
+```
+
+Scan one or more staged or local candidates with repeated paths:
+
+```bash
+python3 scripts/skills_manager.py overlap scan \
+  --candidate <first-skill-directory> \
+  --candidate <second-skill-directory>
+```
+
+Treat the script output only as a broad lexical filter. Prioritize `lexical_candidates`, then review the `scanned_items` names and descriptions for obvious semantic equivalents that share few literal words. Compare only plausible same-object items rather than reading every body. Read the two `SKILL.md` bodies only when their metadata does not establish the boundary; do not inspect scripts, references, or assets for this decision.
+
+Classify a pair as highly overlapping only when all of these are true:
+
+- the Skills operate on the same object;
+- their core actions overlap or one Skill contains the other's capability;
+- common user requests could reasonably trigger both;
+- no clear routing boundary separates them.
+
+Flag a capability subset because it can still cause ambiguous routing. Do not flag Skills merely for sharing a domain when their core actions differ. For example, a Skill that sends email and a Skill that manages email account settings share a domain but have a clear action boundary.
+
+Examples:
+
+- a PPT beautification Skill and a PPT optimization Skill are highly overlapping when both answer requests such as "make this presentation look better";
+- a general email-management Skill and a send-email Skill are highly overlapping when the broader Skill includes sending mail;
+- a send-email Skill and an email-account-settings Skill are not highly overlapping because their core actions and routing boundaries differ.
+
+When no high overlap remains after semantic review, continue without adding an overlap confirmation. When high overlap exists, present all affected pairs in one decision request. Include both descriptions, current scopes, exposures, group memberships, overlap, differences, and the routing risk. Offer four choices for each affected candidate:
+
+- **Keep both:** install the new Skill and keep both routable; do not merge them.
+- **Keep existing:** skip the new candidate and continue unaffected batch items.
+- **Keep new:** first adopt, validate, and expose the candidate at the user-selected scope. Then remove the existing Skill from groups, remove its exposures, and use `remove` so its canonical copy moves to a recoverable backup. For a project preinstallation without an existing root, keep the existing Skill active and defer its retirement until the candidate can be exposed in a supplied project root. If cleanup fails, the new Skill remains active; report the exact old dependencies or canonical paths that remain and offer the normal repair workflow. This is a safe availability order, not an atomic switchover.
+- **Cancel:** stop the affected install or import without changing either Skill.
+
+Never merge, delete, or replace a Skill only because the script returned it as a candidate. Treat same-name collisions through the normal collision workflow and same-target replacements through the update workflow.
+
+After the initial semantic review, record completion with `overlap mark-initial-scan`. Run its dry run first; the completed review authorizes applying this bookkeeping update without a separate overlap prompt when no high overlap exists. If high overlap exists, include the marker update in the consolidated decision plan. Change the preference only on explicit request by dry-running and then applying `overlap set on|off`.
+
+The standard Agent installation workflow uses staging, but direct low-level installer-script calls, external installers, and filesystem copies can bypass this workflow. Skills Manager has no Hook that can intercept them. When an externally placed Skill is later discovered, run a manual canonical scan; do not claim that the earlier installation was checked.
+
+## 7. Groups
 
 A group is a named installation bundle represented by a YAML manifest. It is the user-facing name for the reusable grouping behavior sometimes called a profile.
 
@@ -211,7 +269,7 @@ If no project exists yet, the same group request installs or validates every can
 
 Version 1 does not support nested groups. If one member is missing or conflicting, group installation stops before creating any new links or canonical copies.
 
-## 7. Updates, unlinking, removal, and repair
+## 8. Updates, unlinking, removal, and repair
 
 ### Update
 
@@ -229,9 +287,9 @@ Removing a canonical Skill is refused while recorded exposures, a live global li
 
 The doctor workflow checks canonical Skill validity, missing or invalid scope markers, contradictions between scope markers and global links, missing or invalid group members, broken or redirected recorded symlinks, and stale exposure records. Repairs require approval and affect only the reported item.
 
-## 8. Safety behavior
+## 9. Safety behavior
 
-- Mutating commands show a dry run unless `--apply` is present.
+- Mutating commands show a dry run unless `--apply` is present. Prior migration consent authorizes conflict-free migration applications, and a completed initial overlap review authorizes its bookkeeping marker; other operations retain their explicit plan-confirmation step.
 - Canonical copies are staged and checked against the supported official Skill frontmatter constraints before promotion.
 - State and group manifests are written atomically.
 - Conflicting paths stop the operation.
@@ -241,7 +299,7 @@ The doctor workflow checks canonical Skill validity, missing or invalid scope ma
 - Migration and replacement keep recoverable backups.
 - Permanent deletion, recursive filesystem discovery, automatic Git initialization, and automatic updates are outside the default workflow.
 
-## 9. Examples
+## 10. Examples
 
 ### Install one Skill globally
 
@@ -287,9 +345,9 @@ Skills Manager: The backend group contains fastapi, postgres, and redis. Confirm
 
 If the project does not exist yet, the user can say so; all three canonical Skills are installed into the library, marked `project`, and left without links or separate pending-state records.
 
-## 10. Current limitations
+## 11. Current limitations
 
-- No Hook-based interception of external installation flows.
+- No Hook-based interception of external installation or overlap-check bypasses.
 - No plugin lifecycle management.
 - No nested groups.
 - No automatic update scheduler.

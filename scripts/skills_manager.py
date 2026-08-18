@@ -8,12 +8,14 @@ does not decide installation scope or prompt users; SKILL.md owns those choices.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +42,65 @@ YAML_DATE_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}(?:[Tt ][^ ]+)?")
 SCHEMA_VERSION = 1
 DEFAULT_LIBRARY = Path.home() / "SkillsLibrary"
 GLOBAL_SKILLS_DIR = Path.home() / ".agents" / "skills"
+OVERLAP_DEFAULTS = {"enabled": True, "initial_scan_done": False}
+OVERLAP_STOP_WORDS = {
+    "a",
+    "an",
+    "and",
+    "agent",
+    "agents",
+    "api",
+    "apis",
+    "as",
+    "ask",
+    "asks",
+    "be",
+    "by",
+    "codex",
+    "for",
+    "from",
+    "help",
+    "helps",
+    "in",
+    "into",
+    "is",
+    "it",
+    "local",
+    "manage",
+    "manages",
+    "management",
+    "manager",
+    "managers",
+    "need",
+    "needs",
+    "of",
+    "on",
+    "or",
+    "project",
+    "service",
+    "services",
+    "skill",
+    "skills",
+    "support",
+    "supports",
+    "such",
+    "that",
+    "the",
+    "their",
+    "this",
+    "through",
+    "to",
+    "tool",
+    "tools",
+    "use",
+    "used",
+    "user",
+    "users",
+    "uses",
+    "using",
+    "when",
+    "with",
+}
 
 
 class ManagerError(RuntimeError):
@@ -230,6 +291,7 @@ class Library:
             "exposures": {},
             "skill_scopes": {},
             "backups": [],
+            "overlap": dict(OVERLAP_DEFAULTS),
         }
 
     def ensure_layout(self) -> None:
@@ -251,6 +313,15 @@ class Library:
         state.setdefault("exposures", {})
         state.setdefault("skill_scopes", {})
         state.setdefault("backups", [])
+        overlap = state.setdefault("overlap", {})
+        if not isinstance(overlap, dict):
+            fail(f"Invalid overlap configuration in {self.state_file}")
+        overlap.setdefault("enabled", OVERLAP_DEFAULTS["enabled"])
+        overlap.setdefault("initial_scan_done", OVERLAP_DEFAULTS["initial_scan_done"])
+        if not isinstance(overlap["enabled"], bool):
+            fail(f"Invalid overlap enabled flag in {self.state_file}")
+        if not isinstance(overlap["initial_scan_done"], bool):
+            fail(f"Invalid overlap initial scan flag in {self.state_file}")
         return state
 
     def save_state(self, state: dict[str, Any]) -> None:
@@ -493,6 +564,12 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
     state = lib.load_state()
     canonical = lib.skill_path("skills-manager")
     global_link = GLOBAL_SKILLS_DIR / "skills-manager"
+    canonical_valid = bool(
+        canonical.is_dir()
+        and not canonical.is_symlink()
+        and validate_skill(canonical)["valid"]
+    )
+    global_link_status = link_status(global_link, canonical)
     skills = list_canonical_skills(lib)
     global_skills = [name for name in skills if state["skill_scopes"].get(name) == "global"]
     project_skills = [name for name in skills if state["skill_scopes"].get(name) == "project"]
@@ -516,9 +593,9 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
             "library": str(lib.root),
             "library_exists": lib.root.is_dir(),
             "canonical_manager": str(canonical),
-            "canonical_manager_valid": validate_skill(canonical)["valid"] if canonical.exists() else False,
+            "canonical_manager_valid": canonical_valid,
             "global_manager_link": str(global_link),
-            "global_manager_link_status": link_status(global_link, canonical),
+            "global_manager_link_status": global_link_status,
             "migration_status": state["migration_status"],
             "skills": skills,
             "global_skills": global_skills,
@@ -529,8 +606,261 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
             "groups": list_groups(lib),
             "recorded_exposures": len(state["exposures"]),
             "recoverable_backups": len(state["backups"]),
+            "overlap": dict(state["overlap"]),
         }
     )
+
+
+def overlap_terms(value: str) -> set[str]:
+    """Extract deliberately explainable, low-cost lexical terms."""
+    terms: set[str] = set()
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    for raw in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE):
+        term = raw
+        if len(term) > 4 and term.endswith("ies"):
+            term = term[:-3] + "y"
+        elif len(term) > 4 and term.endswith("s") and not term.endswith("ss"):
+            term = term[:-1]
+        if len(term) >= 2 and term not in OVERLAP_STOP_WORDS:
+            terms.add(term)
+    return terms
+
+
+def overlap_item(
+    path: Path,
+    lib: Library,
+    state: dict[str, Any],
+    kind: str,
+    require_dir_name: bool,
+) -> dict[str, Any]:
+    lexical = lexical_path(path)
+    validation = validate_skill(lexical, require_dir_name=require_dir_name)
+    if not validation["valid"]:
+        fail(f"Cannot scan invalid or missing Skill {lexical}: {validation['errors']}")
+    name = str(validation["name"])
+    details: dict[str, Any] = {
+        "name": name,
+        "description": str(validation["description"]),
+        "path": str(lexical),
+        "kind": kind,
+        "_target": str(resolved(lexical)),
+    }
+    if kind == "canonical":
+        exposures = [
+            {
+                "link": link,
+                "target": item.get("target"),
+                "scope": item.get("scope"),
+                "project": item.get("project"),
+            }
+            for link, item in sorted(state["exposures"].items())
+            if item.get("skill") == name
+        ]
+        global_link = GLOBAL_SKILLS_DIR / name
+        if (
+            link_status(global_link, lexical) == "already-correct"
+            and str(global_link) not in {item["link"] for item in exposures}
+        ):
+            exposures.append(
+                {
+                    "link": str(global_link),
+                    "target": str(lexical),
+                    "scope": "global",
+                    "project": None,
+                }
+            )
+        exposures.sort(key=lambda item: item["link"])
+        details.update(
+            {
+                "scope": state["skill_scopes"].get(name),
+                "exposures": exposures,
+                "group_memberships": group_memberships(lib, name),
+            }
+        )
+    else:
+        details.update({"scope": None, "exposures": [], "group_memberships": []})
+    return details
+
+
+def public_overlap_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if not key.startswith("_")}
+
+
+def overlap_pair(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    return {"left": public_overlap_item(left), "right": public_overlap_item(right)}
+
+
+def overlap_signals(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool, list[dict[str, Any]], list[str]]:
+    left_name = overlap_terms(left["name"])
+    right_name = overlap_terms(right["name"])
+    left_description = overlap_terms(left["description"])
+    right_description = overlap_terms(right["description"])
+    shared_name = sorted(left_name & right_name)
+    shared_description = sorted(left_description & right_description)
+    cross_name_description = sorted(
+        (left_name & right_description) | (right_name & left_description)
+    )
+    shared_terms = sorted((left_name | left_description) & (right_name | right_description))
+    name_score = difflib.SequenceMatcher(
+        None, " ".join(sorted(left_name)), " ".join(sorted(right_name))
+    ).ratio()
+    description_score = difflib.SequenceMatcher(
+        None,
+        " ".join(sorted(left_description)),
+        " ".join(sorted(right_description)),
+    ).ratio()
+
+    signals: list[dict[str, Any]] = []
+    if shared_name:
+        signals.append({"type": "shared-name-terms", "terms": shared_name})
+    if shared_description:
+        signals.append({"type": "shared-description-terms", "terms": shared_description})
+    if cross_name_description:
+        signals.append({"type": "name-description-cross-terms", "terms": cross_name_description})
+    if name_score >= 0.72:
+        signals.append({"type": "similar-names", "score": round(name_score, 3)})
+    if description_score >= 0.62:
+        signals.append({"type": "similar-descriptions", "score": round(description_score, 3)})
+
+    is_candidate = bool(
+        shared_name
+        or (len(shared_description) >= 3 and description_score >= 0.35)
+        or cross_name_description
+        or name_score >= 0.72
+        or description_score >= 0.62
+    )
+    return is_candidate, signals, shared_terms
+
+
+def cmd_overlap_scan(args: argparse.Namespace, lib: Library) -> None:
+    state = lib.load_state()
+    overlap = state["overlap"]
+    candidate_values = list(getattr(args, "candidate", []) or [])
+    payload: dict[str, Any] = {
+        "action": "overlap-scan",
+        "enabled": overlap["enabled"],
+        "initial_scan_done": overlap["initial_scan_done"],
+        "candidate_paths": [str(lexical_path(path)) for path in candidate_values],
+        "semantic_review_notice": (
+            "Lexical signals identify pairs for Agent semantic review; they do not determine "
+            "that Skills have high functional overlap."
+        ),
+    }
+    if not overlap["enabled"]:
+        payload.update(
+            {
+                "skipped": True,
+                "skip_reason": "overlap scanning is disabled",
+                "mode": "disabled",
+                "scanned_items": [],
+                "lexical_candidates": [],
+                "same_name": [],
+                "skipped_same_target": [],
+                "summary": {"pairs_considered": 0},
+            }
+        )
+        emit(payload)
+        return
+
+    canonical_items = [
+        overlap_item(lib.skill_path(name), lib, state, "canonical", True)
+        for name in list_canonical_skills(lib)
+    ]
+    candidate_items = [
+        overlap_item(Path(path), lib, state, "candidate", False) for path in candidate_values
+    ]
+    if candidate_items:
+        pairs = [
+            (candidate, canonical)
+            for candidate in candidate_items
+            for canonical in canonical_items
+        ]
+        pairs.extend(
+            (left, right)
+            for index, left in enumerate(candidate_items)
+            for right in candidate_items[index + 1 :]
+        )
+        mode = "candidates"
+        scanned_items = canonical_items + candidate_items
+    else:
+        pairs = [
+            (left, right)
+            for index, left in enumerate(canonical_items)
+            for right in canonical_items[index + 1 :]
+        ]
+        mode = "canonical-pairs"
+        scanned_items = canonical_items
+
+    lexical_candidates: list[dict[str, Any]] = []
+    same_name: list[dict[str, Any]] = []
+    skipped_same_target: list[dict[str, Any]] = []
+    filtered_out = 0
+    for left, right in pairs:
+        pair = overlap_pair(left, right)
+        if left["_target"] == right["_target"]:
+            skipped_same_target.append(pair)
+            continue
+        if left["name"] == right["name"]:
+            same_name.append(pair)
+            continue
+        is_candidate, signals, shared_terms = overlap_signals(left, right)
+        if not is_candidate:
+            filtered_out += 1
+            continue
+        pair["shared_terms"] = shared_terms
+        pair["signals"] = signals
+        lexical_candidates.append(pair)
+
+    payload.update(
+        {
+            "skipped": False,
+            "mode": mode,
+            "scanned_items": [public_overlap_item(item) for item in scanned_items],
+            "lexical_candidates": lexical_candidates,
+            "same_name": same_name,
+            "skipped_same_target": skipped_same_target,
+            "summary": {
+                "items_scanned": len(scanned_items),
+                "pairs_considered": len(pairs),
+                "lexical_candidates": len(lexical_candidates),
+                "same_name": len(same_name),
+                "skipped_same_target": len(skipped_same_target),
+                "filtered_out": filtered_out,
+            },
+        }
+    )
+    emit(payload)
+
+
+def cmd_overlap_set(args: argparse.Namespace, lib: Library) -> None:
+    state = lib.load_state()
+    new_value = args.setting == "on"
+    payload = {
+        "action": "overlap-set",
+        "apply": args.apply,
+        "previous": state["overlap"]["enabled"],
+        "new": new_value,
+    }
+    if args.apply:
+        lib.ensure_layout()
+        state["overlap"]["enabled"] = new_value
+        lib.save_state(state)
+    emit(payload)
+
+
+def cmd_overlap_mark_initial_scan(args: argparse.Namespace, lib: Library) -> None:
+    state = lib.load_state()
+    payload = {
+        "action": "overlap-mark-initial-scan",
+        "apply": args.apply,
+        "previous": state["overlap"]["initial_scan_done"],
+        "new": True,
+    }
+    if args.apply:
+        lib.ensure_layout()
+        state["overlap"]["initial_scan_done"] = True
+        lib.save_state(state)
+    emit(payload)
 
 
 def cmd_validate(args: argparse.Namespace, lib: Library) -> None:
@@ -784,10 +1114,20 @@ def cmd_migrate(args: argparse.Namespace, lib: Library) -> None:
     emit(migrate_core(lib, lexical_path(args.source), args.scope, args.project, args.apply))
 
 
-def cmd_bootstrap(args: argparse.Namespace, lib: Library) -> None:
-    source = lexical_path(args.source) if args.source else lexical_path(Path(__file__).parent.parent)
+def cmd_initialize_manager(args: argparse.Namespace, lib: Library) -> None:
+    canonical = lib.skill_path("skills-manager")
+    canonical_validation = validate_skill(canonical) if canonical.exists() else {"valid": False}
+    if (
+        canonical.is_dir()
+        and not canonical.is_symlink()
+        and canonical_validation["valid"]
+        and canonical_validation.get("name") == "skills-manager"
+    ):
+        source = canonical
+    else:
+        source = lexical_path(args.source) if args.source else lexical_path(Path(__file__).parent.parent)
     payload = migrate_core(lib, source, "global", None, args.apply, expected_name="skills-manager")
-    payload["action"] = "bootstrap"
+    payload["action"] = "initialize-manager"
     if args.apply:
         payload["next_step"] = "Use the canonical Skill on the next turn; restart Codex if it does not appear."
     emit(payload)
@@ -1138,6 +1478,26 @@ def add_scope(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project", help="Existing project or module root for project scope")
 
 
+def normalize_cli_args(argv: list[str]) -> list[str]:
+    """Map the legacy initialization command without exposing it in help output."""
+    normalized = list(argv)
+    index = 0
+    while index < len(normalized):
+        token = normalized[index]
+        if token == "--library":
+            index += 2
+            continue
+        if token.startswith("--library="):
+            index += 1
+            continue
+        if token in {"-h", "--help"}:
+            return normalized
+        if token == "bootstrap":
+            normalized[index] = "initialize"
+        return normalized
+    return normalized
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", default=str(DEFAULT_LIBRARY), help="Central library root")
@@ -1147,7 +1507,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_apply(init)
     init.set_defaults(func=cmd_init)
 
-    status = sub.add_parser("status", help="Show library, onboarding, and self-bootstrap status")
+    status = sub.add_parser("status", help="Show library, onboarding, and initialization status")
     status.set_defaults(func=cmd_status)
 
     validate = sub.add_parser("validate", help="Validate one Skill directory")
@@ -1182,10 +1542,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_apply(migrate)
     migrate.set_defaults(func=cmd_migrate)
 
-    bootstrap = sub.add_parser("bootstrap", help="Relocate and globally link skills-manager itself")
-    bootstrap.add_argument("--source", help="Currently active skills-manager directory")
-    add_apply(bootstrap)
-    bootstrap.set_defaults(func=cmd_bootstrap)
+    initialize = sub.add_parser("initialize", help="Initialize and globally link skills-manager itself")
+    initialize.add_argument("--source", help="Currently active skills-manager directory")
+    add_apply(initialize)
+    initialize.set_defaults(func=cmd_initialize_manager)
 
     unexpose = sub.add_parser("unexpose", help="Remove only one managed scope symlink")
     unexpose.add_argument("skill")
@@ -1205,6 +1565,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="Validate canonical Skills, groups, and recorded links")
     doctor.set_defaults(func=cmd_doctor)
+
+    overlap = sub.add_parser(
+        "overlap",
+        help="Screen name and description text for possible functional overlap",
+        description=(
+            "Read-only lexical screening for pairs that require Agent semantic review, "
+            "plus dry-run/apply controls for the overlap workflow."
+        ),
+    )
+    overlap_sub = overlap.add_subparsers(dest="overlap_command", required=True)
+
+    overlap_scan = overlap_sub.add_parser(
+        "scan",
+        help="Screen canonical pairs, or candidates against canonical Skills and each other",
+        description=(
+            "With no --candidate, screen every canonical pair. Repeat --candidate to screen "
+            "one or more Skill directories against canonical Skills and one another. Results "
+            "are lexical review candidates, not semantic overlap determinations."
+        ),
+    )
+    overlap_scan.add_argument(
+        "--candidate",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Candidate Skill directory; repeat for batch screening",
+    )
+    overlap_scan.set_defaults(func=cmd_overlap_scan)
+
+    overlap_set = overlap_sub.add_parser(
+        "set", help="Enable or disable overlap scans (dry-run unless --apply)"
+    )
+    overlap_set.add_argument("setting", choices=("on", "off"), help="Desired scan setting")
+    add_apply(overlap_set)
+    overlap_set.set_defaults(func=cmd_overlap_set)
+
+    overlap_mark = overlap_sub.add_parser(
+        "mark-initial-scan",
+        help="Mark the initial overlap scan and semantic review complete",
+    )
+    add_apply(overlap_mark)
+    overlap_mark.set_defaults(func=cmd_overlap_mark_initial_scan)
 
     group = sub.add_parser("group", help="Manage YAML Skill groups")
     group_sub = group.add_subparsers(dest="group_command", required=True)
@@ -1255,7 +1657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(normalize_cli_args(sys.argv[1:]))
     lib = Library(Path(args.library))
     try:
         args.func(args, lib)

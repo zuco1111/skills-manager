@@ -1,4 +1,4 @@
 interface:
   display_name: "Skills Manager"
-  short_description: "Manage skill libraries, scopes, groups, and migrations"
-  default_prompt: "Use $skills-manager to install or organize my Codex skills safely."
+  short_description: "Manage scoped Skills and prevent routing overlap"
+  default_prompt: "Use $skills-manager to install a Skill and check for functional overlap."
