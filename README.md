@@ -4,7 +4,7 @@
 
 ## 中文
 
-Skills Manager 是一个用于管理独立 Codex Skill 的轻量工具。它将 Skill 按作用域区分为通用型 Skill 和项目型 Skill，并通过规范库与作用域符号链接控制 Skill 的可发现范围。
+Skills Manager 是一个面向兼容 Skill 生态的通用管理工具，而不是绑定某个单独 Agent 产品的专用 Skill。它将 Skill 按作用域区分为通用型 Skill 和项目型 Skill，并通过规范库与作用域符号链接控制 Skill 的可发现范围。
 
 它还支持 Skill 分组、迁移、校验和功能重叠检查，帮助减少多个相似 Skill 同时存在时产生的路由歧义。
 
@@ -44,9 +44,11 @@ python3 scripts/skills_manager.py overlap set off --apply
 
 Skills Manager 管理独立 Skill，不负责插件或系统内置 Skill。它没有生命周期 Hook；标准 Agent 安装流程可以先将来源放入 staging，再交给 Skills Manager 检查，但直接调用底层安装脚本或手工复制文件可能绕过检查。
 
+当前实现使用通用的 `.agents/skills` 发现目录，并可在迁移时兼容读取 Codex Skill 目录。
+
 ## English
 
-Skills Manager is a lightweight tool for managing standalone Codex Skills. It classifies Skills by scope as global Skills or project Skills, then controls their discoverability through a canonical library and scoped directory symlinks.
+Skills Manager is a general-purpose manager for compatible agent Skill ecosystems, rather than a utility tied to a single agent product. It classifies Skills by scope as global Skills or project Skills, then controls their discoverability through a canonical library and scoped directory symlinks.
 
 It also supports Skill groups, migration, validation, and functional-overlap checks to reduce routing ambiguity when multiple Skills can answer similar user requests.
 
@@ -85,3 +87,5 @@ python3 scripts/skills_manager.py overlap set off --apply
 ### Boundaries
 
 Skills Manager manages standalone Skills, not plugins or bundled system Skills. It has no lifecycle Hook. The standard Agent installation workflow can stage a source before handing it to Skills Manager, while direct low-level installer calls or manual filesystem copies may bypass the check.
+
+The current implementation uses the shared `.agents/skills` discovery convention and can read Codex-compatible Skill locations during migration.

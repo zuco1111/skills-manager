@@ -16,7 +16,7 @@
 
 ## 1. Purpose and boundaries
 
-Skills Manager keeps one canonical copy of each managed Codex Skill and exposes only the Skills relevant to a user or project. It manages standalone local Skills, not plugins or bundled system Skills.
+Skills Manager is a general-purpose manager for standalone agent Skills across compatible Skill-based environments. It keeps one canonical copy of each managed Skill and exposes only the Skills relevant to a user or project. It does not manage plugins or bundled system Skills.
 
 It is responsible for:
 
@@ -32,7 +32,7 @@ It is responsible for:
 
 It does not author the substantive instructions of a new Skill. Use `skill-creator` for authoring, then use Skills Manager for placement and scope.
 
-Skills Manager is a Skill-only policy and does not install a lifecycle Hook. The Codex `skill-installer` workflow gives a brief initialization notice after installing Skills Manager. Independently, the first Skills Manager invocation checks the existing canonical-copy and global-link status fields and explicitly tells the user to initialize before use when either check fails. Within a Skills Manager workflow, the scope question is mandatory.
+Skills Manager is a Skill-only policy and does not install a lifecycle Hook. An available `skill-installer` workflow can give a brief initialization notice after installing Skills Manager. Independently, the first Skills Manager invocation checks the existing canonical-copy and global-link status fields and explicitly tells the user to initialize before use when either check fails. Within a Skills Manager workflow, the scope question is mandatory.
 
 ## 2. Library layout
 
@@ -97,7 +97,7 @@ The missing project directory is not an error in this branch. The Skill is store
 
 ### Listing Global and project-level Skills
 
-`SkillsLibrary/skills/` is the complete managed inventory, including Skills that Codex cannot currently discover from the active project. The user-selected classification is stored in `state.json` as `skill_scopes`, with one value per canonical Skill: `global` or `project`. `status` always reports:
+`SkillsLibrary/skills/` is the complete managed inventory, including Skills that the active agent cannot currently discover from the current project. The user-selected classification is stored in `state.json` as `skill_scopes`, with one value per canonical Skill: `global` or `project`. `status` always reports:
 
 - `skills`: every canonical managed Skill;
 - `global_skills`: canonical Skills marked `global` by the user;

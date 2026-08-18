@@ -1,6 +1,6 @@
 ---
 name: skills-manager
-description: Install and manage standalone Codex Skills—not plugins or bundled/system/plugin-cache Skills—through a central SkillsLibrary with mandatory global-or-project scope selection and default functional-overlap checks that prevent ambiguous Skill routing. Use when users ask to initialize Skills Manager; install, import, migrate, list, classify, group, update, repair, expose, unlink, remove, deduplicate, compare, or inspect functionally similar Skills; preinstall project Skills before a project exists; install named Skill groups such as "backend skills"; or ask about Skills Manager features and documentation. Store canonical copies in SkillsLibrary and expose them with symlinks. Use skill-creator, not this Skill, to author Skill content.
+description: Install and manage standalone agent Skills across compatible Skill-based environments—not plugins or bundled/system/plugin-cache Skills—through a central SkillsLibrary with mandatory global-or-project scope selection and default functional-overlap checks that prevent ambiguous Skill routing. Use when users ask to initialize Skills Manager; install, import, migrate, list, classify, group, update, repair, expose, unlink, remove, deduplicate, compare, or inspect functionally similar Skills; preinstall project Skills before a project exists; install named Skill groups such as "backend skills"; or ask about Skills Manager features and documentation. Store canonical copies in SkillsLibrary and expose them with symlinks. Use skill-creator, not this Skill, to author Skill content.
 ---
 
 # Skills Manager
@@ -50,7 +50,7 @@ Use initialization when this Skill was installed outside the canonical library o
 4. After confirmation, rerun with `--apply`.
 5. Report the canonical path, symlink path, and any recoverable backup path.
 6. Run the one-time canonical functional-overlap scan described below and record it only after semantic review is complete.
-7. Tell the user the initialized Skill will be used on the next turn; if it does not appear, restart Codex.
+7. Tell the user the initialized Skill will be used on the next turn; if it does not appear, restart the agent client.
 
 The initialization command must be idempotent. It must validate the copied Skill before switching paths and roll back on failure. Keep any legacy CLI compatibility internal and do not surface its old name or terminology in user-facing messages.
 
@@ -109,7 +109,7 @@ After completing the post-initialization semantic review, dry-run `overlap mark-
    ```
 
    The installation is complete once the canonical copy is valid and its scope is marked.
-9. A project-level Skill without a project link is intentionally undiscoverable by Codex until the user later supplies a root; then use `expose --scope project --project <root>`.
+9. A project-level Skill without a project link is intentionally undiscoverable by agents until the user later supplies a root; then use `expose --scope project --project <root>`.
 10. Do not ask about group membership unless the user already requested a group operation.
 
 If installation produces an invalid Skill, leave it unexposed and report the validation errors.
@@ -120,7 +120,7 @@ Ask for scope once for the batch. For project-level, ask whether one root exists
 
 ## List managed Skills
 
-When the user asks which Skills are installed or available, list the complete canonical inventory from `SkillsLibrary/skills/`, not only the Skills Codex can currently discover. Run `status` and present both classifications:
+When the user asks which Skills are installed or available, list the complete canonical inventory from `SkillsLibrary/skills/`, not only the Skills the active agent can currently discover. Run `status` and present both classifications:
 
 - **Global Skills:** canonical Skills carrying the user-selected `global` scope marker.
 - **Project-level Skills:** canonical Skills carrying the user-selected `project` scope marker, including Skills already linked into one or more projects and Skills preinstalled before any project exists.
