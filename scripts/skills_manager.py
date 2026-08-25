@@ -1701,7 +1701,10 @@ def cmd_adopt(args: argparse.Namespace, lib: Library) -> None:
                             "choice": "use-incoming",
                             "mutation": True,
                             "next_command": ["adopt", str(source), "--replace"],
-                            "note": "Review this exact dry-run, then repeat with --apply after confirmation.",
+                            "note": (
+                                "Dry-run this replacement; if it is conflict-free and unchanged, "
+                                "repeat it immediately with --apply without another confirmation."
+                            ),
                         },
                         {"choice": "cancel", "mutation": False},
                     ],
@@ -3137,7 +3140,10 @@ def build_parser() -> argparse.ArgumentParser:
     adopt.add_argument(
         "--replace",
         action="store_true",
-        help="Replace a differing canonical copy after confirmation; rollback copy is transaction-only",
+        help=(
+            "Replace a differing canonical copy after the user selects the incoming version; "
+            "rollback copy is transaction-only"
+        ),
     )
     add_apply(adopt)
     adopt.set_defaults(func=cmd_adopt)

@@ -26,7 +26,7 @@ It is responsible for:
 - selecting a host and a valid user, project, profile, shared, or agent-workspace scope;
 - exposing the same canonical Skill independently to multiple hosts;
 - preinstalling a scoped Skill before its project or workspace exists;
-- migrating user-selected existing and legacy Skills after a dry run and confirmation;
+- migrating user-selected existing and legacy Skills after a conflict-free dry run;
 - detecting functional overlap that could cause ambiguous routing;
 - defining reusable groups of canonical Skill names;
 - validating, updating, unexposing, removing, and repairing managed Skills.
@@ -137,7 +137,7 @@ If OpenClaw uses another workspace, or Hermes is not running in that project, it
 
 ### Normal flow in a recognized host
 
-When Skills Manager is running inside a recognized agent host, it uses that current host and asks only the choice relevant to it:
+When Skills Manager is running inside a recognized agent host, it uses that current host and asks only for choices the request has not already resolved:
 
 - Codex: user-wide or project-level?
 - Claude Code: user-wide or project-level?
@@ -156,9 +156,9 @@ If the named host is unsupported or the requested scope is incompatible, explain
 
 ### Destination available now
 
-For project, module, or agent scope, ask whether the destination exists now. When it does, request the root itself—not the nested Skills directory—and confirm its normalized absolute path. The root must exist, but Skills Manager may create the nested discovery directories.
+For project, module, or agent scope, determine whether the destination exists now. When it does, use the root itself—not the nested Skills directory. The root must exist, but Skills Manager may create the nested discovery directories. Ask only when the root is missing, ambiguous, or normalization would materially change the intended target.
 
-An explicitly confirmed user-wide/global installation may create the standard host discovery directory even when it is currently absent. Detecting a host executable is not a prerequisite for an ordinary Skill installation. Claude Code detection controls only whether initialization offers the optional Claude compatibility entry for Skills Manager itself. If the user wants to preinstall without creating a global discovery directory, record a canonical-only installation with `set-scope` instead.
+A user-selected user-wide/global installation may create the standard host discovery directory even when it is currently absent. Detecting a host executable is not a prerequisite for an ordinary Skill installation. Claude Code detection controls only whether initialization offers the optional Claude compatibility entry for Skills Manager itself. If the user wants to preinstall without creating a global discovery directory, record a canonical-only installation with `set-scope` instead.
 
 ### Preinstall before a destination exists
 
@@ -171,7 +171,7 @@ destination discovery link               # not created yet
 
 The Skill remains in the complete inventory but is intentionally unavailable through that target until the user later supplies the destination root.
 
-To discard that canonical-only target classification without removing the canonical Skill, dry-run and then confirm:
+To discard that canonical-only target classification without removing the canonical Skill, dry-run and, when the result is conflict-free and matches the request, immediately repeat with `--apply`:
 
 ```bash
 python3 scripts/skills_manager.py unset-scope <skill-name> \
@@ -205,11 +205,11 @@ python3 scripts/skills_manager.py initialize \
   --host codex
 ```
 
-After the user confirms the displayed plan, repeat with `--apply`. Initialization validates a staged copy before switching paths, preserves recoverable backups, preflights every requested entry, writes state once, and rolls back the canonical directory, backup move, and newly created links together on failure.
+When the dry run is conflict-free and matches the resolved request, immediately repeat it with `--apply` without asking for another confirmation. Initialization validates a staged copy before switching paths, preserves recoverable backups, preflights every requested entry, writes state once, and rolls back the canonical directory, backup move, and newly created links together on failure.
 
 - `--host codex`, `--host openclaw`, and `--host hermes` create no additional host-native manager link or installation record. They keep only the shared bootstrap.
 - An explicit `--host claude-code` also creates `$HOME/.claude/skills/skills-manager` and records that Claude Code compatibility installation.
-- Initializing for another host never creates the Claude entry automatically. If Claude Code is detected and the compatibility link is absent, the result reports `claude_compatibility.offer: true`. Ask whether the user wants the entry; only after agreement should you dry-run and confirm `initialize --host claude-code`, then apply it.
+- Initializing for another host never creates the Claude entry automatically. If Claude Code is detected and the compatibility link is absent, the result reports `claude_compatibility.offer: true`. Ask whether the user wants the entry; only after agreement should you dry-run `initialize --host claude-code`, then apply it immediately when the preflight is conflict-free.
 
 Detection is advisory and currently means an executable `claude` is available on `PATH` or at a standard macOS/Linux launcher path, including `$HOME/.local/bin/claude` and common Homebrew/system binary directories. A `$HOME/.claude` directory alone is not enough because other Claude clients and extensions can also create it. Detection does not prove that Claude Code is currently running, and it never authorizes a filesystem change.
 
@@ -251,14 +251,14 @@ legacy project -> current Codex project
 For each selected legacy Skill or exposure:
 
 1. Show the existing canonical path, legacy scope, links, and conflicts.
-2. Ask which supported host and compatible scope should own it.
-3. Ask for the required project or workspace root when applicable.
+2. Resolve the supported host and compatible scope, asking only when either remains unspecified or ambiguous.
+3. Resolve the required project or workspace root when applicable, asking only when it is missing, ambiguous, or materially changed by normalization.
 4. Run the consolidated overlap review.
-5. Dry-run the exact migration and show paths, state changes, and backups.
-6. Apply only after the user confirms that dry-run plan.
+5. Dry-run the exact migration and inspect paths, state changes, backups, and conflicts.
+6. Apply immediately when the result matches the selected mapping and is conflict-free; ask only about unresolved items.
 7. Leave unselected or unresolved legacy records unchanged and labeled as legacy.
 
-Conflict-free items may continue after confirmation even if another selected migration item conflicts. Ask only about unresolved items; do not reapply or reconfirm completed ones. Mark migration complete only after the final user-selected set succeeds.
+Conflict-free items may continue immediately even if another selected migration item conflicts. Ask only about unresolved items; do not reapply or reconfirm completed ones. Mark migration complete only after the final user-selected set succeeds.
 
 Existing symlinks that already point to the canonical library can be registered or repaired. For links pointing elsewhere, inspect the target and ask before adoption. Never follow a link and delete its target.
 
@@ -271,14 +271,14 @@ Supported sources include OpenAI curated Skill names, GitHub repository paths or
 The normal sequence is:
 
 1. Resolve the current or requested host.
-2. Ask for a compatible scope and, when linking now, the exact destination root.
+2. Resolve a compatible scope and, when linking now, the exact destination root; ask only when either is missing or ambiguous.
 3. Stage remote content outside the canonical destination or identify the completed local source.
 4. Validate the Skill name, directory name, and `SKILL.md` metadata.
-5. Dry-run `adopt <source>` to compare the source with the canonical inventory. Reuse `content-identical` without a canonical mutation. For `version-choice-required`, ask **use existing**, **use incoming**, or **cancel** before continuing. A new canonical name proceeds as a proposed adoption.
+5. Dry-run `adopt <source>` to compare the source with the canonical inventory. Reuse `content-identical` without a canonical mutation. For `version-choice-required`, provide the compact semantic comparison, recommendation, and affected host/scopes described below before asking **use existing**, **use incoming**, or **cancel**. A new canonical name proceeds as a proposed adoption.
 6. When new canonical content would be introduced—either a new name or an approved incoming version—scan the candidate for functional overlap and complete semantic review.
-7. Confirm and apply the exact adoption or replacement dry run, then validate the canonical copy. Skip this canonical mutation when reusing existing content.
+7. Apply a conflict-free adoption dry run immediately, then validate the canonical copy. For replacement, the user's explicit **use incoming** choice authorizes the matching conflict-free `--replace` plan without another confirmation. Skip this canonical mutation when reusing existing content.
 8. Dry-run the host-specific exposure and inspect every returned runtime requirement, or record a canonical-only host/scope installation when no destination exists.
-9. Include the symlink and its requirements in the confirmation plan, then apply the exposure.
+9. Apply the exposure immediately when its dry run is conflict-free and matches the resolved target. Report its runtime requirements; ask only if satisfying one requires a new user decision or authorization.
 10. Satisfy and verify any OpenClaw target allowlist or Hermes project trust requirement before reporting the Skill as available.
 
 This sequence applies to ordinary Skills. Installing Skills Manager itself uses the initialization exception in section 5 rather than generic `adopt`, `expose`, or `migrate` commands.
@@ -315,21 +315,24 @@ python3 scripts/skills_manager.py expose example \
   --host hermes --scope project --project /work/payments
 ```
 
-Use `--state-dir` or `--profile-home` only when the user selected a non-default OpenClaw or Hermes root. Mutating commands remain dry-runs until `--apply` is added after confirmation.
+Use `--state-dir` or `--profile-home` only when the user selected a non-default OpenClaw or Hermes root. Mutating commands remain dry-runs until `--apply` is added; the agent adds it immediately after a conflict-free preflight that matches the resolved request.
 
 For OpenClaw agent exposure, the output includes `openclaw-allow-symlink-target` with the canonical target that OpenClaw must trust. For Hermes project exposure, it includes `hermes-project-trust` with the project root Hermes must trust. These are post-link runtime prerequisites, not configuration changes performed by the script.
 
 If a canonical name already exists, compare the incoming directory with the canonical content before deciding anything. The deterministic fingerprint includes relative paths, empty directories, regular-file bytes, symlink targets, and executable bits. It ignores entries named `.git` or `__pycache__`, files named `.DS_Store`, and files ending in `.pyc`.
 
 - If the fingerprints match, report `content-identical`, reuse the one canonical directory, and create only the requested host installation when it is missing. Do not adopt a second copy and do not create a backup.
-- If the fingerprints differ, show the added, removed, and changed paths; both fingerprints; every affected host/scope installation and exposure; and group memberships. Ask **use existing**, **use incoming**, or **cancel**. Do not infer a choice from which host initiated the request.
+- If the fingerprints differ, use the added, removed, and changed paths as an inspection index. Read both `SKILL.md` files completely. Inspect another changed text file only when it is needed to understand behavior.
+- Present two to four short bullets covering only material differences in triggers, capabilities, workflow, safety, dependencies, or outputs. State plainly when the difference is only formatting or other non-behavioral text.
+- Follow with one recommendation and its reason, then one sentence listing every affected host/scope. Do not lead with fingerprints, raw path lists, or line-by-line diffs unless the user asks for details.
+- Ask **use existing**, **use incoming**, or **cancel**. Recommend **use existing** for non-behavioral-only differences to avoid churn. Recommend **cancel** and offer a separate `skill-creator` merge when both versions contain valuable unique behavior. Never infer a choice merely from the requesting host.
 - **Use existing** leaves the Library unchanged and continues only with the requested host exposure when needed.
-- **Use incoming** first dry-runs `adopt <source> --replace`. Explain that all host installations reference the same canonical path and therefore switch versions together. Apply only after the user confirms that exact plan.
+- **Use incoming** first dry-runs `adopt <source> --replace`. Explain that all host installations reference the same canonical path and therefore switch versions together. That explicit version choice authorizes the matching conflict-free replacement, so apply it without a second confirmation.
 - **Cancel** changes neither canonical content nor host installations.
 
 If a destination exposure path already exists, do not overwrite or merge it. Show the destination type and resolved path, affected host/scope, and safe conflict choices before any mutation.
 
-For a batch, ask scope once per host target, scan every candidate together, and preflight all canonical and link paths before mutation. A normal batch with a conflicting member stops before leaving a partial installation.
+For a batch, resolve scope once per host target, asking only when the request leaves it ambiguous. Scan every candidate together and preflight all canonical and link paths before mutation. Present all version conflicts together as one compact block per Skill and accept one reply that maps choices to Skills instead of prompting sequentially. A normal batch with a conflicting member stops before leaving a partial installation.
 
 ## 7. Functional-overlap checks
 
@@ -367,7 +370,7 @@ If a pair is highly overlapping, present both descriptions, all host installatio
 
 Never treat a lexical score as the semantic decision. Same-name collisions use the normal conflict or update workflow.
 
-After the initial semantic review, dry-run and then apply `overlap mark-initial-scan`. A completed no-overlap review authorizes that bookkeeping update without another decision prompt. Enabling or disabling future checks still requires explicit confirmation.
+After the initial semantic review, dry-run and then apply `overlap mark-initial-scan`. A completed no-overlap review authorizes that bookkeeping update without another decision prompt. Enabling or disabling future checks is a separate policy choice and requires explicit user intent.
 
 ## 8. Groups
 
@@ -383,7 +386,7 @@ skills:
 
 They never contain copies, destination paths, or nested groups. A Skill may belong to several groups.
 
-Use the complete group lifecycle as follows; every mutation is a dry run until confirmed with `--apply`:
+Use the complete group lifecycle as follows; every mutation is a dry run until a conflict-free result that matches the resolved request is immediately repeated with `--apply`:
 
 - `group list` and `group show <group>` inspect manifests.
 - `group create <group>` creates an empty manifest.
@@ -397,10 +400,10 @@ When installing a group:
 
 1. Show all members.
 2. Resolve the current or named host.
-3. Ask for one compatible scope and destination for the transaction.
+3. Resolve one compatible scope and destination for the transaction, asking only when the request leaves either ambiguous.
 4. Preflight every member and flat link.
 5. Include every returned runtime requirement in the group plan.
-6. Use host-aware `group expose` only after confirmation, then satisfy and verify the requirements before calling the group available.
+6. Apply host-aware `group expose` immediately after a conflict-free preflight, then satisfy and verify the requirements before calling the group available.
 
 For example, a Codex project group creates:
 
@@ -418,9 +421,9 @@ If the project or workspace does not exist yet, validate every canonical member 
 
 ### Update
 
-Begin every update with `adopt <source>` even if the user does not remember installing the Skill through another host. Identical content is reused without copying. Differing content produces a version-choice response and no mutation.
+Begin every update with `adopt <source>` even if the user does not remember installing the Skill through another host. Identical content is reused without copying. Differing content produces the compact semantic comparison, recommendation, impact sentence, and version choices without mutation.
 
-When the user explicitly chooses the incoming version, dry-run and confirm `adopt <source> --replace`. The script copies the incoming Skill to staging, verifies that its fingerprint still matches the approved input, moves the old canonical directory to a transaction-only rollback path, promotes and validates the new directory, writes state, and rechecks every host link that was correct before replacement. After those local checks succeed, it deletes the rollback directory immediately. Stable canonical paths keep every correct host link intact.
+When the user explicitly chooses the incoming version, dry-run `adopt <source> --replace` and apply it immediately when the result matches that choice and is conflict-free. The script copies the incoming Skill to staging, verifies that its fingerprint still matches the approved input, moves the old canonical directory to a transaction-only rollback path, promotes and validates the new directory, writes state, and rechecks every host link that was correct before replacement. After those local checks succeed, it deletes the rollback directory immediately. Stable canonical paths keep every correct host link intact.
 
 Local replacement validation proves canonical Skill structure, exact approved content fingerprint, state persistence, and preservation of previously correct symlinks. It does not prove that OpenClaw trust, Hermes project trust, client reload, or runtime discovery succeeded. Verify those separately before claiming the Skill is callable.
 
@@ -430,7 +433,7 @@ If replacement fails before commit, restore the old canonical directory. If only
 
 Unexposure removes only the selected host/scope link and its exposure record. It never removes the canonical target or another host's installation. The reserved Skills Manager bootstrap cannot be unexposed; only its optional Claude Code compatibility link can be removed this way.
 
-`unset-scope <skill>... --host <host> --scope <scope>` removes only canonical-only installations with `link: null`. It is dry-run by default and requires `--apply` after confirmation. If the installation has a link, `unset-scope` refuses it and the link must be handled with `unexpose`.
+`unset-scope <skill>... --host <host> --scope <scope>` removes only canonical-only installations with `link: null`. It is dry-run by default; repeat it immediately with `--apply` when the result is conflict-free and matches the request. If the installation has a link, `unset-scope` refuses it and the link must be handled with `unexpose`.
 
 A scope change is an explicit plan within one host: preflight `unexpose` for a linked target or `unset-scope` for a canonical-only target, then create the new exposure or record a new canonical-only target. Do not rewrite other host installations.
 
@@ -456,19 +459,21 @@ python3 scripts/skills_manager.py repair <skill-name> \
   --host <host> --scope <scope> [destination options]
 ```
 
-After confirmation, repeat with `--apply`. `repair` may create a missing symlink, repoint a conflicting symlink, or register an already-correct symlink. It refuses every real directory and never changes canonical content. A failed state write restores the previous symlink. Inspect returned runtime requirements before claiming availability.
+For a missing or correct-but-unrecorded symlink, repeat immediately with `--apply` when the dry run is conflict-free and matches the request. Treat a redirected or conflicting symlink as an unresolved decision unless the user already explicitly authorized repointing it. `repair` may create, repoint, or register only that symlink. It refuses every real directory and never changes canonical content. A failed state write restores the previous symlink. Inspect returned runtime requirements before claiming availability.
 
 Do not force unrelated doctor issues through link repair. Use initialization for the reserved Skills Manager bootstrap, group commands for manifests, version adoption for canonical content, and explicit migration for legacy classifications. Never use another host's correct installation as evidence that a broken target should be silently rewritten.
 
 ## 10. Safety behavior
 
-- All mutations are dry-run unless `--apply` is present.
-- Consent to scan for migration is not consent to mutate; the exact migration dry run must be confirmed.
+- All mutations are dry-run unless `--apply` is present. Always preflight first.
+- When a dry run succeeds, matches the resolved request, and reports no conflict or unresolved decision, immediately repeat it with `--apply` without displaying a confirmation prompt.
+- Ask only when preflight exposes a conflict or overwrite resolution, version or overlap choice, ambiguous host, scope, root, target, or batch selection, missing authorization or runtime trust, or another issue the user must decide. Once the user resolves it, rerun any affected preflight and apply a matching conflict-free result without asking again.
+- Consent to scan for migration is not consent to mutate. Obtain the user's selected items and explicit host/scope mappings, then preflight and automatically apply each conflict-free matching plan.
 - The script reports OpenClaw and Hermes runtime trust requirements but does not edit their configuration; link creation alone is not proof of runtime availability.
 - Canonical candidates are staged and validated before promotion.
 - State and group files are written atomically.
 - Conflicting paths stop the affected operation.
-- Claude Code detection only produces an offer; it never creates the compatibility link without an explicit Claude-targeted initialization and confirmed apply.
+- Claude Code detection only produces an offer; it never creates the compatibility link without explicit user intent for a Claude-targeted initialization.
 - Failed batch linking rolls back links created in that transaction.
 - Failed state writes restore paths moved or removed by that transaction.
 - Ordinary directories and junction-like paths are never treated as removable symlinks.
@@ -484,7 +489,7 @@ $HOME/.agents/skills/skills-manager
     -> $HOME/SkillsLibrary/skills/skills-manager
 ```
 
-The requesting host does not receive another manager link. If Claude Code is detected, Skills Manager asks whether to add its separate compatibility entry and leaves the answer unmodified until the user confirms.
+The requesting host does not receive another manager link. If Claude Code is detected, Skills Manager asks whether to add its separate compatibility entry and leaves the answer unmodified until the user chooses.
 
 ### Initialize Skills Manager explicitly for Claude Code
 
@@ -511,7 +516,7 @@ The canonical copy is stored once and linked from `${CODEX_HOME:-$HOME/.codex}/s
 
 ```text
 User: Install database-tools for Claude Code in /work/payments.
-Skills Manager: I will use Claude Code project scope and link it under /work/payments/.claude/skills. Confirm this normalized project root.
+Skills Manager: I will use Claude Code project scope and link it under /work/payments/.claude/skills.
 ```
 
 ### Install for one OpenClaw agent
@@ -568,11 +573,16 @@ Skills Manager creates or verifies only `$HOME/.claude/skills/database-tools`. T
 
 ```text
 User: Install this database-tools update for OpenClaw.
-Skills Manager: The Library already contains database-tools, but its content differs. Choose use existing, use incoming, or cancel. Using incoming switches every Codex, Claude Code, OpenClaw, and Hermes installation that points to this canonical Skill.
+Skills Manager: The versions differ materially.
+- Library-only: preserves the legacy export mode.
+- Incoming-only: adds retry handling and a new validation step.
+Recommendation: cancel and use `skill-creator` to merge the valuable unique behavior.
+Impact: using incoming would switch the existing Codex global and OpenClaw shared installations together.
+Choose use existing, use incoming, or cancel.
 User: Use incoming.
 ```
 
-Skills Manager first shows the exact `adopt <source> --replace` dry run. It applies only after confirmation, validates the new canonical content and all previously correct links, then deletes the transaction-only rollback copy.
+Skills Manager dry-runs the exact `adopt <source> --replace` operation, applies it immediately because **use incoming** already resolved the version choice, validates the new canonical content and all previously correct links, then deletes the transaction-only rollback copy.
 
 ### Expose a group without partial installation
 
@@ -581,7 +591,7 @@ User: Install the backend group in my Codex payments project.
 Skills Manager: The backend group contains fastapi, postgres, and redis. I will preflight all three canonical Skills and links under /work/payments/.agents/skills before changing anything.
 ```
 
-One conflict stops the normal group transaction before any member is linked. A conflict-free, confirmed `group expose` creates one flat symlink per member and leaves the group manifest in the Library.
+One conflict stops the normal group transaction before any member is linked. A conflict-free `group expose` is applied immediately, creates one flat symlink per member, and leaves the group manifest in the Library.
 
 ### Uninstall from one host without deleting the Skill
 
@@ -614,7 +624,7 @@ Skills Manager: I will keep the canonical copy, record a Hermes project installa
 Skills Manager: This Skill is marked legacy global, which does not identify a host. Should it become Codex user-wide, Claude Code user-wide, OpenClaw shared, Hermes profile-wide, or remain legacy?
 ```
 
-The selected mapping is shown as a dry run and applied only after confirmation.
+The selected mapping is dry-run and applied immediately when the result is conflict-free. The mapping choice itself is not reconfirmed.
 
 ## 12. Current limitations
 

@@ -1114,6 +1114,11 @@ class SkillsManagerTests(unittest.TestCase):
             [choice["choice"] for choice in payload["choices"]],
             ["use-existing", "use-incoming", "cancel"],
         )
+        incoming_choice = next(
+            choice for choice in payload["choices"] if choice["choice"] == "use-incoming"
+        )
+        self.assertIn("repeat it immediately with --apply", incoming_choice["note"])
+        self.assertIn("without another confirmation", incoming_choice["note"])
         self.assertEqual((target / "SKILL.md").read_bytes(), before_target)
         self.assertEqual(self.lib.state_file.read_bytes(), before_state)
 
@@ -1802,14 +1807,87 @@ class SkillsManagerTests(unittest.TestCase):
         skill_root = SCRIPT_PATH.parent.parent
         skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         guide_text = (skill_root / "references" / "user-guide.md").read_text(encoding="utf-8")
+        combined_text = skill_text + guide_text
 
-        self.assertNotIn("self-bootstrap", (skill_text + guide_text).lower())
+        self.assertNotIn("self-bootstrap", combined_text.lower())
         self.assertIn("Keep one canonical copy", skill_text)
         self.assertIn("--host codex|claude-code|openclaw|hermes", skill_text)
         self.assertIn("Keep functional-overlap checks enabled by default", skill_text)
         self.assertIn("the Agent makes the semantic decision", skill_text)
         self.assertIn("Never silently reinterpret version-1", skill_text)
         self.assertIn("do not disable discovery rules", skill_text)
+        self.assertIn(
+            "immediately repeat the command with `--apply`; do not pause for a second confirmation",
+            skill_text,
+        )
+        self.assertIn(
+            "immediately repeat it with `--apply` without displaying a confirmation prompt",
+            guide_text,
+        )
+        self.assertIn("A choice already made explicitly", skill_text)
+        self.assertIn("Ask only when preflight exposes a conflict", guide_text)
+        for decision_support in (
+            "read both `SKILL.md` files completely",
+            "two to four bullets",
+            "one recommendation with a reason",
+            "one sentence naming every affected host/scope",
+            "Do not lead with raw paths, fingerprints, or line-by-line diffs",
+            "recommend **cancel** and offer a separate `skill-creator` merge",
+            "accept one reply that maps choices to Skills",
+        ):
+            self.assertIn(decision_support, skill_text)
+        self.assertIn("compact semantic comparison", guide_text)
+        self.assertIn("difference is only formatting", guide_text)
+        self.assertIn("Recommend **use existing** for non-behavioral-only differences", guide_text)
+        self.assertIn("A bare statement such as “`SKILL.md` differs” is not sufficient", skill_text)
+        version_example = guide_text.split("### Choose between different versions", 1)[1].split(
+            "### Expose a group", 1
+        )[0]
+        for example_part in (
+            "- Library-only:",
+            "- Incoming-only:",
+            "Recommendation:",
+            "Impact:",
+            "Choose use existing, use incoming, or cancel.",
+        ):
+            self.assertIn(example_part, version_example)
+        self.assertLess(
+            version_example.index("- Library-only:"),
+            version_example.index("Recommendation:"),
+        )
+        self.assertLess(
+            version_example.index("Recommendation:"), version_example.index("Impact:")
+        )
+        self.assertLess(
+            version_example.index("Impact:"),
+            version_example.index("Choose use existing, use incoming, or cancel."),
+        )
+        self.assertIn(
+            "asking only when either remains unspecified or ambiguous", guide_text
+        )
+        self.assertIn(
+            "asking only when it is missing, ambiguous, or materially changed by normalization",
+            guide_text,
+        )
+        for decision_boundary in (
+            "conflict or overwrite resolution",
+            "version or overlap choice",
+            "ambiguous host, scope, root, target, or batch selection",
+            "missing authorization or runtime trust",
+        ):
+            self.assertIn(decision_boundary, skill_text)
+            self.assertIn(decision_boundary, guide_text)
+        for obsolete_rule in (
+            "all other mutations require confirmation of the exact plan",
+            "After confirmation, repeat with `--apply`",
+            "Apply only after the user confirms that dry-run plan",
+            "every mutation is a dry run until confirmed with `--apply`",
+            "requires `--apply` after confirmation",
+            "applied only after confirmation",
+            "Ask which supported host and compatible scope should own it",
+            "Ask for the required project or workspace root when applicable",
+        ):
+            self.assertNotIn(obsolete_rule, combined_text)
         for choice in ("keep both", "keep existing", "keep new", "cancel"):
             self.assertIn(choice, skill_text.lower())
         self.assertIn("reserved bootstrap exception", guide_text)
