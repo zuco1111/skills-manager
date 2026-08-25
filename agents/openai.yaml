@@ -1,4 +1,4 @@
 interface:
   display_name: "Skills Manager"
-  short_description: "Manage scoped Skills and prevent routing overlap"
-  default_prompt: "Use $skills-manager to install a Skill and check for functional overlap."
+  short_description: "Manage Skills across agent hosts and scopes"
+  default_prompt: "Use $skills-manager to install or manage a standalone Skill for the correct agent host and scope while reusing its canonical copy and checking version or functional overlap conflicts."

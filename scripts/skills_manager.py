@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import unicodedata
@@ -23,7 +25,14 @@ from typing import Any, Iterable
 
 
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-ALLOWED_FRONTMATTER_KEYS = {"name", "description", "license", "allowed-tools", "metadata"}
+ALLOWED_FRONTMATTER_KEYS = {
+    "name",
+    "description",
+    "license",
+    "compatibility",
+    "allowed-tools",
+    "metadata",
+}
 YAML_BOOLEAN_OR_NULL = {
     "null",
     "~",
@@ -40,9 +49,21 @@ YAML_NUMBER_RE = re.compile(
 )
 YAML_DATE_RE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}(?:[Tt ][^ ]+)?")
 SCHEMA_VERSION = 1
+HOST_MODEL_VERSION = 2
 DEFAULT_LIBRARY = Path.home() / "SkillsLibrary"
 GLOBAL_SKILLS_DIR = Path.home() / ".agents" / "skills"
+SUPPORTED_HOSTS = ("codex", "claude-code", "openclaw", "hermes")
+SUPPORTED_SCOPES = {
+    "legacy": {"global", "project"},
+    "codex": {"global", "project"},
+    "claude-code": {"global", "project"},
+    "openclaw": {"global", "agent"},
+    "hermes": {"global", "project"},
+}
 OVERLAP_DEFAULTS = {"enabled": True, "initial_scan_done": False}
+CONTENT_IGNORE_DIRS = {".git", "__pycache__"}
+CONTENT_IGNORE_FILES = {".DS_Store"}
+CONTENT_DIFF_PATH_LIMIT = 100
 OVERLAP_STOP_WORDS = {
     "a",
     "an",
@@ -274,6 +295,110 @@ def validate_skill(skill_dir: Path, require_dir_name: bool = True) -> dict[str, 
     }
 
 
+def skill_content_manifest(skill_dir: Path) -> dict[str, dict[str, Any]]:
+    """Return a deterministic, portable manifest for version comparison."""
+    root = resolved(skill_dir)
+    if not root.is_dir():
+        fail(f"Cannot fingerprint a non-directory Skill: {root}")
+
+    manifest: dict[str, dict[str, Any]] = {}
+    for current_text, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        current = Path(current_text)
+        kept_dirs: list[str] = []
+        for dirname in sorted(dirnames):
+            if dirname in CONTENT_IGNORE_DIRS:
+                continue
+            path = current / dirname
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                manifest[relative] = {"type": "symlink", "target": os.readlink(path)}
+            else:
+                manifest[relative] = {"type": "directory"}
+                kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
+
+        for filename in sorted(filenames):
+            if (
+                filename in CONTENT_IGNORE_DIRS
+                or filename in CONTENT_IGNORE_FILES
+                or filename.endswith(".pyc")
+            ):
+                continue
+            path = current / filename
+            relative = path.relative_to(root).as_posix()
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                manifest[relative] = {"type": "symlink", "target": os.readlink(path)}
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                manifest[relative] = {
+                    "type": "file",
+                    "sha256": digest.hexdigest(),
+                    "executable": bool(metadata.st_mode & 0o111),
+                }
+                continue
+            manifest[relative] = {
+                "type": "other",
+                "mode": stat.S_IFMT(metadata.st_mode),
+            }
+    return dict(sorted(manifest.items()))
+
+
+def manifest_fingerprint(manifest: dict[str, dict[str, Any]]) -> str:
+    encoded = json.dumps(
+        manifest,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def compare_skill_contents(current: Path, incoming: Path) -> dict[str, Any]:
+    current_manifest = skill_content_manifest(current)
+    incoming_manifest = skill_content_manifest(incoming)
+    current_paths = set(current_manifest)
+    incoming_paths = set(incoming_manifest)
+    added = sorted(incoming_paths - current_paths)
+    removed = sorted(current_paths - incoming_paths)
+    changed = sorted(
+        path
+        for path in current_paths & incoming_paths
+        if current_manifest[path] != incoming_manifest[path]
+    )
+
+    def limited(paths: list[str]) -> list[str]:
+        return paths[:CONTENT_DIFF_PATH_LIMIT]
+
+    return {
+        "identical": not added and not removed and not changed,
+        "current_fingerprint": manifest_fingerprint(current_manifest),
+        "incoming_fingerprint": manifest_fingerprint(incoming_manifest),
+        "ignored": {
+            "names": sorted(CONTENT_IGNORE_DIRS),
+            "files": sorted(CONTENT_IGNORE_FILES),
+            "suffixes": [".pyc"],
+        },
+        "added": limited(added),
+        "removed": limited(removed),
+        "changed": limited(changed),
+        "counts": {
+            "current_entries": len(current_manifest),
+            "incoming_entries": len(incoming_manifest),
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+        },
+        "paths_truncated": any(
+            len(paths) > CONTENT_DIFF_PATH_LIMIT for paths in (added, removed, changed)
+        ),
+    }
+
+
 class Library:
     def __init__(self, root: Path):
         self.root = lexical_path(root)
@@ -287,8 +412,10 @@ class Library:
     def default_state(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
+            "host_model_version": HOST_MODEL_VERSION,
             "migration_status": "not-asked",
             "exposures": {},
+            "installations": {},
             "skill_scopes": {},
             "backups": [],
             "overlap": dict(OVERLAP_DEFAULTS),
@@ -311,8 +438,14 @@ class Library:
             fail(f"Unsupported state schema in {self.state_file}")
         state.setdefault("migration_status", "not-asked")
         state.setdefault("exposures", {})
+        state.setdefault("host_model_version", HOST_MODEL_VERSION)
+        state.setdefault("installations", {})
         state.setdefault("skill_scopes", {})
         state.setdefault("backups", [])
+        if state["host_model_version"] != HOST_MODEL_VERSION:
+            fail(f"Unsupported host model in {self.state_file}")
+        if not isinstance(state["installations"], dict):
+            fail(f"Invalid installations data in {self.state_file}")
         overlap = state.setdefault("overlap", {})
         if not isinstance(overlap, dict):
             fail(f"Invalid overlap configuration in {self.state_file}")
@@ -352,6 +485,10 @@ class Library:
     def stage_path(self, name: str) -> Path:
         safe_name = validate_identifier(name)
         return self.staging / f"{safe_name}-{uuid.uuid4().hex}"
+
+    def rollback_path(self, name: str, kind: str) -> Path:
+        safe_name = validate_identifier(name)
+        return self.staging / f".{kind}-rollback-v1-{safe_name}-{uuid.uuid4().hex}"
 
 
 def list_canonical_skills(lib: Library) -> list[str]:
@@ -426,18 +563,135 @@ def list_groups(lib: Library) -> list[str]:
     return sorted(path.stem for path in lib.groups.glob("*.yaml") if path.is_file())
 
 
-def scope_link(name: str, scope: str, project: str | None) -> tuple[Path, Path | None]:
+def normalized_host(host: str | None) -> str:
+    value = host or "legacy"
+    if value != "legacy" and value not in SUPPORTED_HOSTS:
+        fail(f"Unsupported host {value!r}; choose one of {SUPPORTED_HOSTS}")
+    return value
+
+
+def default_host_root(host: str) -> Path:
+    if host == "codex":
+        return lexical_path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    if host == "claude-code":
+        return lexical_path(Path.home() / ".claude")
+    if host == "openclaw":
+        return lexical_path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw")))
+    if host == "hermes":
+        return lexical_path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    fail(f"Host {host!r} has no native root")
+
+
+def claude_code_executable_candidates() -> tuple[Path, ...]:
+    return (
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+        Path("/usr/bin/claude"),
+    )
+
+
+def claude_code_detected() -> bool:
+    """Return whether this user profile appears to have Claude Code installed."""
+    if shutil.which("claude") is not None:
+        return True
+    return any(
+        path.is_file() and os.access(path, os.X_OK)
+        for path in claude_code_executable_candidates()
+    )
+
+
+def manager_claude_link() -> Path:
+    return default_host_root("claude-code") / "skills" / "skills-manager"
+
+
+def is_reserved_manager_bootstrap_exposure(
+    link_text: str,
+    item: dict[str, Any],
+    canonical: Path,
+) -> bool:
+    target_text = item.get("target")
+    return bool(
+        link_text == str(GLOBAL_SKILLS_DIR / "skills-manager")
+        and item.get("skill") == "skills-manager"
+        and item.get("host", "legacy") == "legacy"
+        and item.get("scope") == "global"
+        and target_text
+        and resolved(Path(target_text)) == resolved(canonical)
+    )
+
+
+def validate_host_options(
+    host: str,
+    scope: str,
+    project: str | None,
+    workspace: str | None,
+    state_dir: str | None,
+    profile_home: str | None,
+) -> None:
+    if scope not in SUPPORTED_SCOPES[host]:
+        allowed = ", ".join(sorted(SUPPORTED_SCOPES[host]))
+        fail(f"Scope {scope!r} is not valid for host {host!r}; choose {allowed}")
+    if project and not (scope == "project" and host in {"legacy", "codex", "claude-code", "hermes"}):
+        fail("--project is valid only for a project scope")
+    if workspace and not (host == "openclaw" and scope == "agent"):
+        fail("--workspace is valid only for OpenClaw agent scope")
+    if state_dir and not (host == "openclaw" and scope == "global"):
+        fail("--state-dir is valid only for OpenClaw global scope")
+    if profile_home and not (host == "hermes" and scope == "global"):
+        fail("--profile-home is valid only for Hermes global scope")
+
+
+def scope_link(
+    name: str,
+    scope: str,
+    project: str | None,
+    host: str | None = None,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    profile_home: str | None = None,
+) -> tuple[Path, Path | None]:
     validate_identifier(name, "Skill name")
-    if scope == "global":
-        if project:
-            fail("--project is not valid with global scope")
-        return GLOBAL_SKILLS_DIR / name, None
-    if not project:
-        fail("Project scope requires --project with an existing project or module root")
-    project_root = lexical_path(project)
+    selected_host = normalized_host(host)
+    validate_host_options(
+        selected_host, scope, project, workspace, state_dir, profile_home
+    )
+
+    if selected_host == "legacy":
+        if scope == "global":
+            return GLOBAL_SKILLS_DIR / name, None
+        project_root = lexical_path(project) if project else None
+        suffix = Path(".agents") / "skills"
+    elif selected_host == "codex":
+        if scope == "global":
+            return default_host_root(selected_host) / "skills" / name, None
+        project_root = lexical_path(project) if project else None
+        suffix = Path(".agents") / "skills"
+    elif selected_host == "claude-code":
+        if scope == "global":
+            return default_host_root(selected_host) / "skills" / name, None
+        project_root = lexical_path(project) if project else None
+        suffix = Path(".claude") / "skills"
+    elif selected_host == "openclaw":
+        if scope == "global":
+            root = lexical_path(state_dir) if state_dir else default_host_root(selected_host)
+            return root / "skills" / name, None
+        project_root = lexical_path(workspace) if workspace else None
+        suffix = Path("skills")
+    else:
+        if scope == "global":
+            root = lexical_path(profile_home) if profile_home else default_host_root(selected_host)
+            return root / "skills" / name, None
+        project_root = lexical_path(project) if project else None
+        suffix = Path(".hermes") / "skills"
+
+    label = "OpenClaw agent workspace" if selected_host == "openclaw" else "Project or module root"
+    if project_root is None:
+        option = "--workspace" if selected_host == "openclaw" else "--project"
+        fail(f"{label} scope requires {option} with an existing directory")
     if not project_root.is_dir():
-        fail(f"Project or module root does not exist: {project_root}")
-    return project_root / ".agents" / "skills" / name, project_root
+        fail(f"{label} does not exist: {project_root}")
+    return project_root / suffix / name, project_root
 
 
 def link_status(link: Path, target: Path) -> str:
@@ -450,14 +704,30 @@ def link_status(link: Path, target: Path) -> str:
     return "conflict-existing-path"
 
 
-def ensure_scope_compatible(name: str, scope: str, target: Path) -> None:
-    if scope != "project":
+def ensure_scope_compatible(
+    name: str,
+    scope: str,
+    target: Path,
+    host: str | None = None,
+    state_dir: str | None = None,
+    profile_home: str | None = None,
+) -> None:
+    selected_host = normalized_host(host)
+    if scope == "global":
         return
-    global_status = link_status(GLOBAL_SKILLS_DIR / name, target)
+    global_link, _ = scope_link(
+        name,
+        "global",
+        None,
+        selected_host,
+        state_dir=state_dir,
+        profile_home=profile_home,
+    )
+    global_status = link_status(global_link, target)
     if global_status == "already-correct":
         fail(
-            f"Skill {name!r} is globally exposed; unexpose it globally before "
-            "classifying or exposing it as project-level"
+            f"Skill {name!r} is globally exposed for host {selected_host!r}; "
+            f"unexpose that host-global binding before adding {scope!r} scope"
         )
 
 
@@ -473,30 +743,174 @@ def record_backup(state: dict[str, Any], path: Path, source: Path, kind: str) ->
 
 
 def record_exposure(
-    state: dict[str, Any], link: Path, target: Path, skill: str, scope: str, project: Path | None
+    state: dict[str, Any],
+    link: Path,
+    target: Path,
+    skill: str,
+    scope: str,
+    project: Path | None,
+    host: str | None = None,
+    workspace: Path | None = None,
+    state_dir: Path | None = None,
+    profile_home: Path | None = None,
 ) -> None:
+    selected_host = normalized_host(host)
     state["exposures"][str(link)] = {
         "skill": skill,
         "target": str(target),
+        "host": selected_host,
         "scope": scope,
         "project": str(project) if project else None,
+        "workspace": str(workspace) if workspace else None,
+        "state_dir": str(state_dir) if state_dir else None,
+        "profile_home": str(profile_home) if profile_home else None,
     }
 
 
-def apply_exposures(
-    lib: Library,
-    items: list[dict[str, Any]],
+def record_installation(
+    state: dict[str, Any],
+    skill: str,
+    host: str,
     scope: str,
-    project_root: Path | None,
-) -> list[str]:
+    link: Path | None,
+    project: Path | None = None,
+    workspace: Path | None = None,
+    state_dir: Path | None = None,
+    profile_home: Path | None = None,
+) -> None:
+    selected_host = normalized_host(host)
+    if selected_host == "legacy":
+        state["skill_scopes"][skill] = scope
+        return
+    records = state["installations"].setdefault(skill, [])
+    if not isinstance(records, list):
+        fail(f"Invalid installation records for Skill {skill!r}")
+    record = {
+        "host": selected_host,
+        "scope": scope,
+        "link": str(link) if link else None,
+        "project": str(project) if project else None,
+        "workspace": str(workspace) if workspace else None,
+        "state_dir": str(state_dir) if state_dir else None,
+        "profile_home": str(profile_home) if profile_home else None,
+    }
+    if link is None and any(
+        item.get("host") == selected_host
+        and item.get("scope") == scope
+        and item.get("link")
+        for item in records
+    ):
+        return
+    identity = (
+        selected_host,
+        scope,
+        record["link"],
+        record["project"],
+        record["workspace"],
+        record["state_dir"],
+        record["profile_home"],
+    )
+    kept = []
+    for item in records:
+        existing_identity = (
+            item.get("host"),
+            item.get("scope"),
+            item.get("link"),
+            item.get("project"),
+            item.get("workspace"),
+            item.get("state_dir"),
+            item.get("profile_home"),
+        )
+        if existing_identity == identity:
+            continue
+        if (
+            link is not None
+            and item.get("host") == selected_host
+            and item.get("scope") == scope
+            and not item.get("link")
+        ):
+            continue
+        kept.append(item)
+    kept.append(record)
+    kept.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    state["installations"][skill] = kept
+
+
+def remove_installation_for_link(state: dict[str, Any], skill: str, link: Path, host: str) -> None:
+    records = state["installations"].get(skill, [])
+    if not isinstance(records, list):
+        return
+    remaining = [
+        item
+        for item in records
+        if not (item.get("host") == host and item.get("link") == str(link))
+    ]
+    if remaining:
+        state["installations"][skill] = remaining
+    else:
+        state["installations"].pop(skill, None)
+
+
+def clear_legacy_scope_if_unexposed(state: dict[str, Any], skill: str) -> bool:
+    has_legacy_exposure = any(
+        item.get("skill") == skill and item.get("host", "legacy") == "legacy"
+        for item in state["exposures"].values()
+    )
+    if has_legacy_exposure:
+        return False
+    return state["skill_scopes"].pop(skill, None) is not None
+
+
+def exposure_requirements(item: dict[str, Any]) -> list[dict[str, str]]:
+    host = item["host"]
+    scope = item["scope"]
+    if host == "openclaw" and scope == "agent":
+        return [
+            {
+                "type": "openclaw-allow-symlink-target",
+                "target": str(item["target"]),
+                "note": "Trust this canonical Skill target before OpenClaw loads the workspace symlink.",
+            }
+        ]
+    if host == "hermes" and scope == "project":
+        return [
+            {
+                "type": "hermes-project-trust",
+                "project": str(item["context_root"]),
+                "note": "Hermes must trust the project before loading project Skills.",
+            }
+        ]
+    return []
+
+
+def apply_exposure_items(lib: Library, items: list[dict[str, Any]]) -> list[str]:
     state = lib.load_state()
     created: list[Path] = []
     try:
         for item in items:
-            state["skill_scopes"][item["skill"]] = scope
+            record_installation(
+                state,
+                item["skill"],
+                item["host"],
+                item["scope"],
+                item["link"],
+                project=item.get("project"),
+                workspace=item.get("workspace"),
+                state_dir=item.get("state_dir"),
+                profile_home=item.get("profile_home"),
+            )
             if item["status"] == "already-correct":
                 record_exposure(
-                    state, item["link"], item["target"], item["skill"], scope, project_root
+                    state,
+                    item["link"],
+                    item["target"],
+                    item["skill"],
+                    item["scope"],
+                    item.get("project"),
+                    item["host"],
+                    item.get("workspace"),
+                    item.get("state_dir"),
+                    item.get("profile_home"),
                 )
                 continue
             item["link"].parent.mkdir(parents=True, exist_ok=True)
@@ -505,7 +919,16 @@ def apply_exposures(
             if resolved(item["link"]) != resolved(item["target"]):
                 fail(f"Created link did not resolve to target: {item['link']}")
             record_exposure(
-                state, item["link"], item["target"], item["skill"], scope, project_root
+                state,
+                item["link"],
+                item["target"],
+                item["skill"],
+                item["scope"],
+                item.get("project"),
+                item["host"],
+                item.get("workspace"),
+                item.get("state_dir"),
+                item.get("profile_home"),
             )
         lib.save_state(state)
     except Exception:
@@ -516,24 +939,94 @@ def apply_exposures(
     return [str(path) for path in created]
 
 
+def apply_exposures(
+    lib: Library,
+    items: list[dict[str, Any]],
+    scope: str,
+    project_root: Path | None,
+    host: str | None = None,
+) -> list[str]:
+    """Apply one homogeneous exposure plan; retained for the command API."""
+    return apply_exposure_items(lib, items)
+
+
 def plan_exposures(
-    lib: Library, names: Iterable[str], scope: str, project: str | None
+    lib: Library,
+    names: Iterable[str],
+    scope: str,
+    project: str | None,
+    host: str | None = None,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    profile_home: str | None = None,
 ) -> tuple[list[dict[str, Any]], Path | None]:
     items: list[dict[str, Any]] = []
     project_root: Path | None = None
+    selected_host = normalized_host(host)
+    state = lib.load_state()
     for name in names:
         target = lib.skill_path(name)
         result = validate_skill(target)
         if not result["valid"]:
             fail(f"Cannot expose invalid or missing Skill {name!r}: {result['errors']}")
-        ensure_scope_compatible(name, scope, target)
-        link, this_project = scope_link(name, scope, project)
+        ensure_scope_compatible(
+            name,
+            scope,
+            target,
+            selected_host,
+            state_dir=state_dir,
+            profile_home=profile_home,
+        )
+        link, this_project = scope_link(
+            name,
+            scope,
+            project,
+            selected_host,
+            workspace,
+            state_dir,
+            profile_home,
+        )
         if project_root is None:
             project_root = this_project
         status = link_status(link, target)
         if status.startswith("conflict"):
             fail(f"Exposure conflict at {link}: {status}")
-        items.append({"skill": name, "target": target, "link": link, "status": status})
+        recorded = state["exposures"].get(str(link))
+        if recorded and recorded.get("host", "legacy") != selected_host:
+            fail(
+                f"Exposure record conflict at {link}: belongs to host "
+                f"{recorded.get('host', 'legacy')!r}; unexpose that binding first"
+            )
+        context_root = this_project
+        resolved_state_dir = (
+            lexical_path(state_dir)
+            if selected_host == "openclaw" and scope == "global" and state_dir
+            else default_host_root("openclaw")
+            if selected_host == "openclaw" and scope == "global"
+            else None
+        )
+        resolved_profile_home = (
+            lexical_path(profile_home)
+            if selected_host == "hermes" and scope == "global" and profile_home
+            else default_host_root("hermes")
+            if selected_host == "hermes" and scope == "global"
+            else None
+        )
+        item = {
+            "skill": name,
+            "target": target,
+            "link": link,
+            "status": status,
+            "host": selected_host,
+            "scope": scope,
+            "context_root": context_root,
+            "project": this_project if scope == "project" else None,
+            "workspace": this_project if selected_host == "openclaw" and scope == "agent" else None,
+            "state_dir": resolved_state_dir,
+            "profile_home": resolved_profile_home,
+        }
+        item["requirements"] = exposure_requirements(item)
+        items.append(item)
     return items, project_root
 
 
@@ -545,6 +1038,99 @@ def copy_skill_to_stage(lib: Library, source: Path, name: str) -> Path:
         shutil.rmtree(stage, ignore_errors=True)
         fail(f"Staged Skill validation failed: {result['errors']}")
     return stage
+
+
+def skill_link_snapshot(
+    state: dict[str, Any], name: str, target: Path
+) -> dict[str, Any]:
+    candidates: dict[str, bool] = {}
+    for link_text, item in state["exposures"].items():
+        if isinstance(item, dict) and item.get("skill") == name:
+            candidates[str(link_text)] = True
+    records = state["installations"].get(name, [])
+    if isinstance(records, list):
+        for record in records:
+            if isinstance(record, dict) and record.get("link"):
+                candidates[str(record["link"])] = True
+
+    known_global_links = [GLOBAL_SKILLS_DIR / name]
+    for host in SUPPORTED_HOSTS:
+        host_link, _ = scope_link(name, "global", None, host)
+        known_global_links.append(host_link)
+    for link in known_global_links:
+        if lexists(link):
+            candidates.setdefault(str(link), False)
+
+    correct: list[str] = []
+    issues: list[dict[str, Any]] = []
+    for link_text, recorded in sorted(candidates.items()):
+        status = link_status(Path(link_text), target)
+        if status == "already-correct":
+            correct.append(link_text)
+        elif recorded:
+            issues.append({"link": link_text, "status": status})
+    return {"correct": correct, "preexisting_issues": issues}
+
+
+def replacement_impact(
+    lib: Library, state: dict[str, Any], name: str, target: Path
+) -> dict[str, Any]:
+    records = state["installations"].get(name, [])
+    installations = records if isinstance(records, list) else []
+    exposures: list[dict[str, Any]] = []
+    host_scopes: set[str] = set()
+    for record in installations:
+        if not isinstance(record, dict):
+            continue
+        host_scopes.add(f"{record.get('host')}:{record.get('scope')}")
+    for link_text, item in sorted(state["exposures"].items()):
+        if not isinstance(item, dict) or item.get("skill") != name:
+            continue
+        host = item.get("host", "legacy")
+        scope = item.get("scope")
+        host_scopes.add(f"{host}:{scope}")
+        exposures.append(
+            {
+                "link": link_text,
+                "host": host,
+                "scope": scope,
+                "status": link_status(Path(link_text), target),
+            }
+        )
+    snapshot = skill_link_snapshot(state, name, target)
+    return {
+        "host_scopes": sorted(host_scopes),
+        "installations": installations,
+        "exposures": exposures,
+        "correct_links_to_revalidate": snapshot["correct"],
+        "preexisting_link_issues": snapshot["preexisting_issues"],
+        "groups": group_memberships(lib, name),
+        "all_installations_switch_together": True,
+    }
+
+
+def validate_promoted_replacement(
+    target: Path, name: str, incoming_fingerprint: str, expected_links: list[str]
+) -> dict[str, Any]:
+    validation = validate_skill(target)
+    if not validation["valid"] or validation["name"] != name:
+        fail(f"Promoted Skill failed validation: {validation['errors']}")
+    promoted_fingerprint = manifest_fingerprint(skill_content_manifest(target))
+    if promoted_fingerprint != incoming_fingerprint:
+        fail("Promoted Skill content fingerprint does not match the approved incoming version")
+    link_results = [
+        {"link": link_text, "status": link_status(Path(link_text), target)}
+        for link_text in expected_links
+    ]
+    broken = [item for item in link_results if item["status"] != "already-correct"]
+    if broken:
+        fail(f"Replacement changed previously correct host links: {broken}")
+    return {
+        "canonical": validation,
+        "fingerprint": promoted_fingerprint,
+        "links": link_results,
+        "runtime_availability_verified": False,
+    }
 
 
 def cmd_init(args: argparse.Namespace, lib: Library) -> None:
@@ -573,8 +1159,35 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
     skills = list_canonical_skills(lib)
     global_skills = [name for name in skills if state["skill_scopes"].get(name) == "global"]
     project_skills = [name for name in skills if state["skill_scopes"].get(name) == "project"]
+    installed_names = {
+        name for name, records in state["installations"].items() if isinstance(records, list) and records
+    }
+    installation_status: dict[str, list[dict[str, Any]]] = {}
+    for name, records in sorted(state["installations"].items()):
+        target = lib.skill_path(name)
+        if not isinstance(records, list):
+            installation_status[name] = [{"status": "invalid-installation-records"}]
+            continue
+        status_records: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                status_records.append({"status": "invalid-installation-record"})
+                continue
+            item = dict(record)
+            link_text = record.get("link")
+            item["status"] = (
+                link_status(Path(str(link_text)), target)
+                if link_text
+                else "canonical-only"
+            )
+            item["expected_target"] = str(target)
+            status_records.append(item)
+        installation_status[name] = status_records
     unclassified_skills = [
-        name for name in skills if state["skill_scopes"].get(name) not in {"global", "project"}
+        name
+        for name in skills
+        if state["skill_scopes"].get(name) not in {"global", "project"}
+        and name not in installed_names
     ]
     global_exposure_status = {
         name: link_status(GLOBAL_SKILLS_DIR / name, lib.skill_path(name)) for name in global_skills
@@ -588,6 +1201,54 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
         name: sorted(set(projects))
         for name, projects in sorted(recorded_project_exposures.items())
     }
+    claude_link = manager_claude_link()
+    claude_status = link_status(claude_link, canonical)
+    bootstrap_modes = {
+        "codex": "bootstrap",
+        "openclaw": "bootstrap",
+        "hermes": "bootstrap-external-directory",
+    }
+    manager_host_exposure_status = {
+        host: {
+            "link": str(global_link),
+            "status": global_link_status,
+            "mode": mode,
+        }
+        for host, mode in bootstrap_modes.items()
+    }
+    manager_host_exposure_status["claude-code"] = {
+        "link": str(claude_link),
+        "status": claude_status,
+        "mode": "compatibility-link",
+    }
+    claude_detected = claude_code_detected()
+    claude_compatibility = {
+        "detected": claude_detected,
+        "link": str(claude_link),
+        "status": claude_status,
+        "offer": bool(claude_detected and claude_status != "already-correct"),
+    }
+    legacy_bindings_pending: list[str] = []
+    for name in skills:
+        legacy_exposures = [
+            (link_text, item)
+            for link_text, item in state["exposures"].items()
+            if item.get("skill") == name and item.get("host", "legacy") == "legacy"
+        ]
+        if name == "skills-manager":
+            unexpected = any(
+                not is_reserved_manager_bootstrap_exposure(link_text, item, canonical)
+                for link_text, item in legacy_exposures
+            )
+            invalid_scope_marker = (
+                name in state["skill_scopes"]
+                and state["skill_scopes"].get(name) != "global"
+            )
+            if unexpected or invalid_scope_marker:
+                legacy_bindings_pending.append(name)
+            continue
+        if name in state["skill_scopes"] or legacy_exposures:
+            legacy_bindings_pending.append(name)
     emit(
         {
             "library": str(lib.root),
@@ -596,7 +1257,20 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
             "canonical_manager_valid": canonical_valid,
             "global_manager_link": str(global_link),
             "global_manager_link_status": global_link_status,
+            "manager_bootstrap": {
+                "link": str(global_link),
+                "status": global_link_status,
+                "target": str(canonical),
+            },
+            "claude_code_detected": claude_detected,
+            "claude_compatibility_offer": claude_compatibility["offer"],
+            "claude_compatibility": claude_compatibility,
             "migration_status": state["migration_status"],
+            "host_model_version": state["host_model_version"],
+            "installations": state["installations"],
+            "installation_status": installation_status,
+            "legacy_bindings_pending": legacy_bindings_pending,
+            "manager_host_exposure_status": manager_host_exposure_status,
             "skills": skills,
             "global_skills": global_skills,
             "global_exposure_status": global_exposure_status,
@@ -650,8 +1324,10 @@ def overlap_item(
             {
                 "link": link,
                 "target": item.get("target"),
+                "host": item.get("host", "legacy"),
                 "scope": item.get("scope"),
                 "project": item.get("project"),
+                "workspace": item.get("workspace"),
             }
             for link, item in sorted(state["exposures"].items())
             if item.get("skill") == name
@@ -665,20 +1341,25 @@ def overlap_item(
                 {
                     "link": str(global_link),
                     "target": str(lexical),
+                    "host": "legacy",
                     "scope": "global",
                     "project": None,
+                    "workspace": None,
                 }
             )
         exposures.sort(key=lambda item: item["link"])
         details.update(
             {
                 "scope": state["skill_scopes"].get(name),
+                "installations": state["installations"].get(name, []),
                 "exposures": exposures,
                 "group_memberships": group_memberships(lib, name),
             }
         )
     else:
-        details.update({"scope": None, "exposures": [], "group_memberships": []})
+        details.update(
+            {"scope": None, "installations": [], "exposures": [], "group_memberships": []}
+        )
     return details
 
 
@@ -871,14 +1552,40 @@ def cmd_validate(args: argparse.Namespace, lib: Library) -> None:
 
 
 def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
-    roots: list[tuple[str, Path]] = [("user", GLOBAL_SKILLS_DIR)]
-    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-    roots.append(("user-compat", lexical_path(codex_home) / "skills"))
-    for project in args.project or []:
+    requested_hosts = getattr(args, "host", None) or []
+    selected_hosts = sorted(set(requested_hosts)) if requested_hosts else list(SUPPORTED_HOSTS)
+    include_legacy = (
+        bool(getattr(args, "include_legacy", False)) if requested_hosts else True
+    )
+    roots: list[tuple[str, Path]] = []
+    if include_legacy:
+        roots.append(("legacy-user", GLOBAL_SKILLS_DIR))
+    for host in selected_hosts:
+        roots.append((f"{host}-global", default_host_root(host) / "skills"))
+
+    project_hosts = [host for host in selected_hosts if host != "openclaw"]
+    projects = getattr(args, "project", None) or []
+    if projects and not project_hosts:
+        fail("--project requires codex, claude-code, or hermes in --host")
+    for project in projects:
         root = lexical_path(project)
         if not root.is_dir():
             fail(f"Project or module root does not exist: {root}")
-        roots.append(("project", root / ".agents" / "skills"))
+        if "codex" in project_hosts:
+            roots.append(("codex-project", root / ".agents" / "skills"))
+        if "claude-code" in project_hosts:
+            roots.append(("claude-code-project", root / ".claude" / "skills"))
+        if "hermes" in project_hosts:
+            roots.append(("hermes-project", root / ".hermes" / "skills"))
+
+    workspaces = getattr(args, "workspace", None) or []
+    if workspaces and "openclaw" not in selected_hosts:
+        fail("--workspace requires openclaw in --host")
+    for workspace in workspaces:
+        root = lexical_path(workspace)
+        if not root.is_dir():
+            fail(f"OpenClaw agent workspace does not exist: {root}")
+        roots.append(("openclaw-agent", root / "skills"))
 
     candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -887,6 +1594,8 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
             continue
         for child in sorted(root.iterdir(), key=lambda item: item.name):
             if child.name.startswith(".") or child.name == ".system":
+                continue
+            if child.absolute() == (GLOBAL_SKILLS_DIR / "skills-manager").absolute():
                 continue
             key = str(child.absolute())
             if key in seen or (not child.is_dir() and not child.is_symlink()):
@@ -907,7 +1616,14 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
                     "errors": validation["errors"],
                 }
             )
-    emit({"roots": [{"scope": scope, "path": str(path)} for scope, path in roots], "candidates": candidates})
+    emit(
+        {
+            "hosts": selected_hosts,
+            "include_legacy": include_legacy,
+            "roots": [{"scope": scope, "path": str(path)} for scope, path in roots],
+            "candidates": candidates,
+        }
+    )
 
 
 def cmd_adopt(args: argparse.Namespace, lib: Library) -> None:
@@ -917,19 +1633,96 @@ def cmd_adopt(args: argparse.Namespace, lib: Library) -> None:
         fail(f"Source Skill is invalid: {validation['errors']}")
     name = validate_identifier(str(validation["name"]), "Skill name")
     target = lib.skill_path(name)
-    if target.exists() and resolved(target) == source:
+    target_present = lexists(target)
+    if name == "skills-manager" and not target_present:
+        fail("Use initialize --source <path> --host <host> to install Skills Manager itself")
+    if target_present and (target.is_symlink() or not target.is_dir()):
+        fail(f"Existing canonical Skill is not a real directory: {target}")
+    if target_present and resolved(target) == source:
         emit({"action": "adopt", "result": "already-canonical", "skill": name, "target": str(target)})
         return
-    if target.exists() and not args.replace:
-        fail(f"Canonical Skill already exists at {target}; use --replace only after explicit confirmation")
+    canonical_location = resolved(target)
+    if source in canonical_location.parents or canonical_location in source.parents:
+        fail(
+            "Source and canonical paths must not contain one another; choose a separate "
+            f"incoming directory ({source} vs {canonical_location})"
+        )
+
+    comparison: dict[str, Any] | None = None
+    impact: dict[str, Any] | None = None
+    state = lib.load_state()
+    if target_present:
+        target_validation = validate_skill(target)
+        if not target_validation["valid"]:
+            fail(f"Existing canonical Skill is invalid: {target}")
+        comparison = compare_skill_contents(target, source)
+        impact = replacement_impact(lib, state, name, target)
+        if comparison["identical"]:
+            emit(
+                {
+                    "action": "reuse-existing",
+                    "apply": args.apply,
+                    "mutation": False,
+                    "result": "content-identical",
+                    "skill": name,
+                    "source": str(source),
+                    "target": str(target),
+                    "comparison": comparison,
+                    "installations": impact,
+                    "next_step": (
+                        "Reuse this canonical copy; expose it only for the requested host and "
+                        "scope if that installation is not already correct."
+                    ),
+                }
+            )
+            return
+        if not args.replace:
+            emit(
+                {
+                    "action": "version-choice-required",
+                    "apply": False,
+                    "mutation": False,
+                    "skill": name,
+                    "incoming": str(source),
+                    "current": str(target),
+                    "comparison": comparison,
+                    "installations": impact,
+                    "warning": (
+                        "Choosing the incoming version replaces the one canonical copy, so every "
+                        "recorded host installation for this Skill switches together."
+                    ),
+                    "choices": [
+                        {
+                            "choice": "use-existing",
+                            "mutation": False,
+                            "next_step": "Expose the existing canonical copy for the requested host if needed.",
+                        },
+                        {
+                            "choice": "use-incoming",
+                            "mutation": True,
+                            "next_command": ["adopt", str(source), "--replace"],
+                            "note": "Review this exact dry-run, then repeat with --apply after confirmation.",
+                        },
+                        {"choice": "cancel", "mutation": False},
+                    ],
+                }
+            )
+            return
 
     plan = {
-        "action": "replace" if target.exists() else "adopt",
+        "action": "replace" if target_present else "adopt",
         "apply": args.apply,
         "skill": name,
         "source": str(source),
         "target": str(target),
-        "existing_target": target.exists(),
+        "existing_target": target_present,
+        "comparison": comparison,
+        "installations": impact,
+        "rollback_backup": {
+            "retention": "transaction-only" if target_present else "not-needed",
+            "directory": str(lib.staging),
+            "delete_after_local_validation": target_present,
+        },
     }
     if not args.apply:
         emit(plan)
@@ -937,70 +1730,292 @@ def cmd_adopt(args: argparse.Namespace, lib: Library) -> None:
 
     lib.ensure_layout()
     stage = copy_skill_to_stage(lib, source, name)
-    backup: Path | None = None
+    rollback: Path | None = None
+    target_created = False
+    committed = False
+    expected_fingerprint = (
+        comparison["incoming_fingerprint"]
+        if comparison
+        else manifest_fingerprint(skill_content_manifest(source))
+    )
+    staged_fingerprint = manifest_fingerprint(skill_content_manifest(stage))
+    if staged_fingerprint != expected_fingerprint:
+        shutil.rmtree(stage, ignore_errors=True)
+        fail("Staged Skill content changed while it was being copied; review the source and retry")
+    link_snapshot = skill_link_snapshot(state, name, target) if target_present else {
+        "correct": [],
+        "preexisting_issues": [],
+    }
     try:
-        if target.exists():
-            backup = lib.backup_path(name, "replace")
-            shutil.move(str(target), str(backup))
+        if target_present:
+            rollback = lib.rollback_path(name, "replace")
+            shutil.move(str(target), str(rollback))
         os.replace(stage, target)
-        result = validate_skill(target)
-        if not result["valid"]:
-            fail(f"Promoted Skill failed validation: {result['errors']}")
-        state = lib.load_state()
-        if backup:
-            record_backup(state, backup, target, "replace")
+        target_created = True
+        plan["validation"] = validate_promoted_replacement(
+            target,
+            name,
+            expected_fingerprint,
+            link_snapshot["correct"],
+        )
         lib.save_state(state)
-    except Exception:
+        committed = True
+    except Exception as exc:
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
-        if target.exists() and backup and backup.exists():
-            shutil.rmtree(target, ignore_errors=True)
-        if backup and backup.exists() and not target.exists():
-            shutil.move(str(backup), str(target))
+        rollback_error: Exception | None = None
+        try:
+            if target_created and lexists(target):
+                if target.is_symlink() or not target.is_dir():
+                    fail(f"Cannot remove unexpected promoted target during rollback: {target}")
+                shutil.rmtree(target)
+            if lexists(target):
+                fail(f"Cannot restore the previous canonical Skill because the target still exists: {target}")
+            if rollback and rollback.exists():
+                shutil.move(str(rollback), str(target))
+        except Exception as rollback_exc:
+            rollback_error = rollback_exc
+        if rollback_error:
+            fail(f"Adoption failed ({exc}); rollback also failed ({rollback_error})")
         raise
-    plan["backup"] = str(backup) if backup else None
+
+    cleanup_pending: dict[str, str] | None = None
+    rollback_deleted = rollback is None
+    if committed and rollback and rollback.exists():
+        try:
+            shutil.rmtree(rollback)
+            rollback_deleted = True
+        except Exception as cleanup_exc:
+            cleanup_pending = {"path": str(rollback), "error": str(cleanup_exc)}
+    plan["backup"] = None
+    plan["rollback_backup_deleted"] = rollback_deleted
+    plan["cleanup_pending"] = cleanup_pending
+    plan["preexisting_link_issues"] = link_snapshot["preexisting_issues"]
     emit(plan)
 
 
 def cmd_expose(args: argparse.Namespace, lib: Library) -> None:
-    items, project_root = plan_exposures(lib, [args.skill], args.scope, args.project)
+    if args.skill == "skills-manager":
+        fail("Use initialize --host <host> for the reserved Skills Manager bootstrap")
+    host = getattr(args, "host", None)
+    items, project_root = plan_exposures(
+        lib,
+        [args.skill],
+        args.scope,
+        getattr(args, "project", None),
+        host,
+        getattr(args, "workspace", None),
+        getattr(args, "state_dir", None),
+        getattr(args, "profile_home", None),
+    )
     payload = {
         "action": "expose",
         "apply": args.apply,
+        "host": normalized_host(host),
         "scope": args.scope,
         "project": str(project_root) if project_root else None,
         "links": [
-            {"skill": item["skill"], "link": str(item["link"]), "target": str(item["target"]), "status": item["status"]}
+            {
+                "skill": item["skill"],
+                "link": str(item["link"]),
+                "target": str(item["target"]),
+                "status": item["status"],
+                "requirements": item["requirements"],
+            }
             for item in items
         ],
     }
     if args.apply:
         lib.ensure_layout()
-        payload["created"] = apply_exposures(lib, items, args.scope, project_root)
+        payload["created"] = apply_exposures(
+            lib, items, args.scope, project_root, normalized_host(host)
+        )
+    emit(payload)
+
+
+def cmd_repair(args: argparse.Namespace, lib: Library) -> None:
+    name = validate_identifier(args.skill, "Skill name")
+    if name == "skills-manager":
+        fail("Use initialize --host <host> to repair the reserved Skills Manager bootstrap")
+    host = normalized_host(args.host)
+    target = lib.skill_path(name)
+    validation = validate_skill(target)
+    if target.is_symlink() or not validation["valid"]:
+        fail(f"Cannot repair an exposure for an invalid canonical Skill: {validation['errors']}")
+    ensure_scope_compatible(
+        name,
+        args.scope,
+        target,
+        host,
+        state_dir=getattr(args, "state_dir", None),
+        profile_home=getattr(args, "profile_home", None),
+    )
+    link, context_root = scope_link(
+        name,
+        args.scope,
+        getattr(args, "project", None),
+        host,
+        getattr(args, "workspace", None),
+        getattr(args, "state_dir", None),
+        getattr(args, "profile_home", None),
+    )
+    status = link_status(link, target)
+    if status == "conflict-existing-path":
+        fail(f"Refusing to repair a non-symlink path: {link}")
+
+    state = lib.load_state()
+    recorded = state["exposures"].get(str(link))
+    if recorded and recorded.get("host", "legacy") != host:
+        fail(
+            f"Exposure record conflict at {link}: belongs to host "
+            f"{recorded.get('host', 'legacy')!r}"
+        )
+
+    project_root = context_root if args.scope == "project" else None
+    workspace_root = context_root if host == "openclaw" and args.scope == "agent" else None
+    state_root = (
+        lexical_path(args.state_dir)
+        if host == "openclaw" and args.scope == "global" and args.state_dir
+        else default_host_root("openclaw")
+        if host == "openclaw" and args.scope == "global"
+        else None
+    )
+    profile_root = (
+        lexical_path(args.profile_home)
+        if host == "hermes" and args.scope == "global" and args.profile_home
+        else default_host_root("hermes")
+        if host == "hermes" and args.scope == "global"
+        else None
+    )
+    requirement_item = {
+        "host": host,
+        "scope": args.scope,
+        "target": target,
+        "context_root": context_root,
+    }
+    operation = (
+        "register" if status == "already-correct"
+        else "create" if status == "create"
+        else "repoint"
+    )
+    previous_link_text = os.readlink(link) if link.is_symlink() else None
+    payload = {
+        "action": "repair-exposure",
+        "apply": args.apply,
+        "skill": name,
+        "host": host,
+        "scope": args.scope,
+        "project": str(project_root) if project_root else None,
+        "workspace": str(workspace_root) if workspace_root else None,
+        "link": str(link),
+        "target": str(target),
+        "status": status,
+        "operation": operation,
+        "previous_link_target": previous_link_text,
+        "requirements": exposure_requirements(requirement_item),
+        "touches_real_directories": False,
+    }
+    if not args.apply:
+        emit(payload)
+        return
+
+    lib.ensure_layout()
+    filesystem_changed = False
+    try:
+        if status.startswith("conflict-symlink"):
+            link.unlink()
+            filesystem_changed = True
+        if status != "already-correct":
+            link.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(target, link, target_is_directory=True)
+            filesystem_changed = True
+        if link_status(link, target) != "already-correct":
+            fail(f"Repaired link did not resolve to the canonical target: {link}")
+        record_installation(
+            state,
+            name,
+            host,
+            args.scope,
+            link,
+            project=project_root,
+            workspace=workspace_root,
+            state_dir=state_root,
+            profile_home=profile_root,
+        )
+        record_exposure(
+            state,
+            link,
+            target,
+            name,
+            args.scope,
+            project_root,
+            host,
+            workspace_root,
+            state_root,
+            profile_root,
+        )
+        lib.save_state(state)
+    except Exception as exc:
+        if filesystem_changed:
+            try:
+                if lexists(link):
+                    if not link.is_symlink() or resolved(link) != resolved(target):
+                        fail(f"Cannot roll back repair because the link changed again: {link}")
+                    link.unlink()
+                if previous_link_text is not None:
+                    os.symlink(previous_link_text, link, target_is_directory=True)
+            except Exception as rollback_exc:
+                fail(f"Repair failed ({exc}); rollback also failed ({rollback_exc})")
+        raise
+    payload["result"] = "repaired" if filesystem_changed else "registered"
     emit(payload)
 
 
 def cmd_set_scope(args: argparse.Namespace, lib: Library) -> None:
     names = list(dict.fromkeys(validate_identifier(name, "Skill name") for name in args.skills))
+    if "skills-manager" in names:
+        fail("Use initialize --host <host> for the reserved Skills Manager bootstrap")
     state = lib.load_state()
+    host = normalized_host(getattr(args, "host", None))
+    project = getattr(args, "project", None)
+    workspace = getattr(args, "workspace", None)
+    state_dir = getattr(args, "state_dir", None)
+    profile_home = getattr(args, "profile_home", None)
+    validate_host_options(host, args.scope, project, workspace, state_dir, profile_home)
     items: list[dict[str, Any]] = []
     for name in names:
         target = lib.skill_path(name)
         result = validate_skill(target)
         if not result["valid"]:
             fail(f"Cannot classify invalid or missing Skill {name!r}: {result['errors']}")
-        global_status = link_status(GLOBAL_SKILLS_DIR / name, target)
+        global_link, _ = scope_link(
+            name,
+            "global",
+            None,
+            host,
+            state_dir=state_dir,
+            profile_home=profile_home,
+        )
+        global_status = link_status(global_link, target)
         if args.scope == "global" and global_status != "already-correct":
             fail(
-                f"Cannot mark {name!r} global without a correct global link; "
-                "use expose --scope global"
+                f"Cannot mark {name!r} global for host {host!r} without a correct link; "
+                f"use expose --host {host} --scope global"
             )
-        ensure_scope_compatible(name, args.scope, target)
+        ensure_scope_compatible(
+            name,
+            args.scope,
+            target,
+            host,
+            state_dir=state_dir,
+            profile_home=profile_home,
+        )
         items.append(
             {
                 "skill": name,
                 "target": str(target),
                 "previous_scope": state["skill_scopes"].get(name),
+                "previous_installations": state["installations"].get(name, []),
                 "new_scope": args.scope,
             }
         )
@@ -1008,12 +2023,74 @@ def cmd_set_scope(args: argparse.Namespace, lib: Library) -> None:
     payload: dict[str, Any] = {
         "action": "set-scope",
         "apply": args.apply,
+        "host": host,
         "scope": args.scope,
         "skills": items,
     }
     if args.apply:
         for name in names:
-            state["skill_scopes"][name] = args.scope
+            record_installation(
+                state,
+                name,
+                host,
+                args.scope,
+                None,
+                project=lexical_path(project) if project else None,
+                workspace=lexical_path(workspace) if workspace else None,
+                state_dir=lexical_path(state_dir) if state_dir else None,
+                profile_home=lexical_path(profile_home) if profile_home else None,
+            )
+        lib.ensure_layout()
+        lib.save_state(state)
+    emit(payload)
+
+
+def cmd_unset_scope(args: argparse.Namespace, lib: Library) -> None:
+    names = list(dict.fromkeys(validate_identifier(name, "Skill name") for name in args.skills))
+    host = normalized_host(args.host)
+    if host == "legacy":
+        fail("Use legacy unexpose to clear a legacy scope marker")
+    if args.scope not in SUPPORTED_SCOPES[host]:
+        allowed = ", ".join(sorted(SUPPORTED_SCOPES[host]))
+        fail(f"Scope {args.scope!r} is not valid for host {host!r}; choose {allowed}")
+    state = lib.load_state()
+    plans: list[dict[str, Any]] = []
+    for name in names:
+        records = state["installations"].get(name, [])
+        if not isinstance(records, list):
+            fail(f"Invalid installation records for Skill {name!r}")
+        matching = [
+            item
+            for item in records
+            if item.get("host") == host and item.get("scope") == args.scope
+        ]
+        if not matching:
+            fail(f"No {host}:{args.scope} installation exists for Skill {name!r}")
+        linked = [item for item in matching if item.get("link")]
+        if linked:
+            fail(f"Unexpose linked installations before clearing their scope: {linked}")
+        plans.append({"skill": name, "remove": matching})
+
+    payload = {
+        "action": "unset-scope",
+        "apply": args.apply,
+        "host": host,
+        "scope": args.scope,
+        "skills": plans,
+    }
+    if args.apply:
+        for plan in plans:
+            name = plan["skill"]
+            records = state["installations"].get(name, [])
+            remaining = [
+                item
+                for item in records
+                if not (item.get("host") == host and item.get("scope") == args.scope)
+            ]
+            if remaining:
+                state["installations"][name] = remaining
+            else:
+                state["installations"].pop(name, None)
         lib.ensure_layout()
         lib.save_state(state)
     emit(payload)
@@ -1026,6 +2103,11 @@ def migrate_core(
     project: str | None,
     apply: bool,
     expected_name: str | None = None,
+    host: str | None = None,
+    workspace: str | None = None,
+    state_dir: str | None = None,
+    profile_home: str | None = None,
+    additional_hosts: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     source = lexical_path(source)
     if source.is_symlink():
@@ -1037,10 +2119,47 @@ def migrate_core(
     if expected_name and name != expected_name:
         fail(f"Expected Skill {expected_name!r}, found {name!r}")
     target = lib.skill_path(name)
-    ensure_scope_compatible(name, scope, target)
-    link, project_root = scope_link(name, scope, project)
+    selected_host = normalized_host(host)
+    ensure_scope_compatible(
+        name,
+        scope,
+        target,
+        selected_host,
+        state_dir=state_dir,
+        profile_home=profile_home,
+    )
+    link, project_root = scope_link(
+        name,
+        scope,
+        project,
+        selected_host,
+        workspace,
+        state_dir,
+        profile_home,
+    )
+    additional_hosts = tuple(dict.fromkeys(normalized_host(value) for value in additional_hosts))
+    if "legacy" in additional_hosts or selected_host in additional_hosts:
+        fail("Additional migration hosts must be distinct explicit hosts")
     if resolved(source) == resolved(target):
-        items, project_root = plan_exposures(lib, [name], scope, project)
+        items, project_root = plan_exposures(
+            lib,
+            [name],
+            scope,
+            project,
+            selected_host,
+            workspace,
+            state_dir,
+            profile_home,
+        )
+        for additional_host in additional_hosts:
+            additional_items, _ = plan_exposures(
+                lib,
+                [name],
+                scope,
+                project,
+                additional_host,
+            )
+            items.extend(additional_items)
         payload = {
             "action": "migrate",
             "result": "already-canonical",
@@ -1048,18 +2167,73 @@ def migrate_core(
             "skill": name,
             "source": str(source),
             "target": str(target),
+            "host": selected_host,
             "link": str(items[0]["link"]),
+            "requirements": items[0]["requirements"],
+            "additional_exposures": [
+                {
+                    "host": item["host"],
+                    "link": str(item["link"]),
+                    "status": item["status"],
+                    "requirements": item["requirements"],
+                }
+                for item in items[1:]
+            ],
         }
         if apply:
             lib.ensure_layout()
-            payload["created"] = apply_exposures(lib, items, scope, project_root)
+            payload["created"] = apply_exposure_items(lib, items)
         return payload
     if target.exists():
         fail(f"Canonical destination already exists: {target}")
-    status = link_status(link, target)
-    source_is_link_path = source == link and source.is_dir() and not source.is_symlink()
-    if status.startswith("conflict") and not source_is_link_path:
-        fail(f"Exposure conflict at {link}: {status}")
+    exposure_items: list[dict[str, Any]] = []
+    planning_state = lib.load_state()
+    for exposure_host, exposure_link, exposure_project in [
+        (selected_host, link, project_root),
+        *[
+            (additional_host, scope_link(name, scope, project, additional_host)[0], None)
+            for additional_host in additional_hosts
+        ],
+    ]:
+        status = link_status(exposure_link, target)
+        source_is_link_path = (
+            source == exposure_link and source.is_dir() and not source.is_symlink()
+        )
+        source_symlink_target = (
+            os.readlink(exposure_link)
+            if exposure_link.is_symlink()
+            and resolved(exposure_link) == resolved(source)
+            else None
+        )
+        if (
+            status.startswith("conflict")
+            and not source_is_link_path
+            and source_symlink_target is None
+        ):
+            fail(f"Exposure conflict at {exposure_link}: {status}")
+        recorded = planning_state["exposures"].get(str(exposure_link))
+        if recorded and recorded.get("host", "legacy") != exposure_host:
+            fail(
+                f"Exposure record conflict at {exposure_link}: belongs to host "
+                f"{recorded.get('host', 'legacy')!r}; unexpose that binding first"
+            )
+        exposure_items.append(
+            {
+                "skill": name,
+                "target": target,
+                "link": exposure_link,
+                "status": status,
+                "host": exposure_host,
+                "scope": scope,
+                "context_root": exposure_project,
+                "project": exposure_project if scope == "project" else None,
+                "workspace": None,
+                "state_dir": None,
+                "profile_home": None,
+                "requirements": [],
+                "replace_source_symlink_target": source_symlink_target,
+            }
+        )
 
     payload: dict[str, Any] = {
         "action": "migrate",
@@ -1067,18 +2241,50 @@ def migrate_core(
         "skill": name,
         "source": str(source),
         "target": str(target),
+        "host": selected_host,
         "scope": scope,
         "project": str(project_root) if project_root else None,
         "link": str(link),
+        "additional_exposures": [
+            {
+                "host": item["host"],
+                "link": str(item["link"]),
+                "status": item["status"],
+                "requirements": item["requirements"],
+                "repoints_source_symlink": item["replace_source_symlink_target"] is not None,
+            }
+            for item in exposure_items[1:]
+        ],
+        "repoints_source_symlink": (
+            exposure_items[0]["replace_source_symlink_target"] is not None
+        ),
         "source_becomes_backup": True,
     }
+    legacy_state = lib.load_state()
+    legacy_source_record = legacy_state["exposures"].get(str(source))
+    clears_legacy_binding = bool(
+        selected_host != "legacy"
+        and legacy_source_record
+        and legacy_source_record.get("skill") == name
+        and legacy_source_record.get("host", "legacy") == "legacy"
+    )
+    payload["clears_legacy_binding"] = clears_legacy_binding
+    payload["legacy_scope_present"] = legacy_state["skill_scopes"].get(name)
+    requirement_item = {
+        "host": selected_host,
+        "scope": scope,
+        "target": target,
+        "context_root": project_root,
+    }
+    payload["requirements"] = exposure_requirements(requirement_item)
     if not apply:
         return payload
 
     lib.ensure_layout()
     stage = copy_skill_to_stage(lib, resolved(source), name)
     backup = lib.backup_path(name, "migrate")
-    link_created = False
+    created_links: list[Path] = []
+    replaced_source_symlinks: list[tuple[Path, str]] = []
     target_created = False
     source_moved = False
     try:
@@ -1086,35 +2292,125 @@ def migrate_core(
         target_created = True
         shutil.move(str(source), str(backup))
         source_moved = True
-        link.parent.mkdir(parents=True, exist_ok=True)
-        os.symlink(target, link, target_is_directory=True)
-        link_created = True
-        if resolved(link) != resolved(target):
-            fail(f"Created link did not resolve to target: {link}")
+        for item in exposure_items:
+            exposure_link = item["link"]
+            source_symlink_target = item["replace_source_symlink_target"]
+            if source_symlink_target is not None:
+                exposure_link.unlink()
+                replaced_source_symlinks.append(
+                    (exposure_link, source_symlink_target)
+                )
+            if item["status"] != "already-correct":
+                exposure_link.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(target, exposure_link, target_is_directory=True)
+                created_links.append(exposure_link)
+            if resolved(exposure_link) != resolved(target):
+                fail(f"Created link did not resolve to target: {exposure_link}")
         state = lib.load_state()
         record_backup(state, backup, source, "migrate")
-        record_exposure(state, link, target, name, scope, project_root)
-        state["skill_scopes"][name] = scope
+        if clears_legacy_binding:
+            existing_legacy = state["exposures"].get(str(source))
+            if (
+                existing_legacy
+                and existing_legacy.get("skill") == name
+                and existing_legacy.get("host", "legacy") == "legacy"
+            ):
+                state["exposures"].pop(str(source), None)
+            clear_legacy_scope_if_unexposed(state, name)
+        resolved_state_dir = (
+            lexical_path(state_dir)
+            if state_dir
+            else default_host_root("openclaw")
+            if selected_host == "openclaw" and scope == "global"
+            else None
+        )
+        resolved_profile_home = (
+            lexical_path(profile_home)
+            if profile_home
+            else default_host_root("hermes")
+            if selected_host == "hermes" and scope == "global"
+            else None
+        )
+        resolved_workspace = (
+            project_root if selected_host == "openclaw" and scope == "agent" else None
+        )
+        resolved_project = project_root if scope == "project" else None
+        for item in exposure_items:
+            item_project = resolved_project if item["host"] == selected_host else None
+            item_workspace = resolved_workspace if item["host"] == selected_host else None
+            item_state_dir = resolved_state_dir if item["host"] == selected_host else None
+            item_profile_home = resolved_profile_home if item["host"] == selected_host else None
+            record_exposure(
+                state,
+                item["link"],
+                target,
+                name,
+                scope,
+                item_project,
+                item["host"],
+                item_workspace,
+                item_state_dir,
+                item_profile_home,
+            )
+            record_installation(
+                state,
+                name,
+                item["host"],
+                scope,
+                item["link"],
+                project=item_project,
+                workspace=item_workspace,
+                state_dir=item_state_dir,
+                profile_home=item_profile_home,
+            )
         lib.save_state(state)
     except Exception:
-        if link_created and link.is_symlink():
-            link.unlink()
+        for created_link in reversed(created_links):
+            if created_link.is_symlink():
+                created_link.unlink()
         if source_moved and backup.exists() and not source.exists():
             shutil.move(str(backup), str(source))
+        for replaced_link, original_target in reversed(replaced_source_symlinks):
+            if not lexists(replaced_link):
+                os.symlink(original_target, replaced_link, target_is_directory=True)
         if target_created and target.exists():
             shutil.rmtree(target, ignore_errors=True)
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
         raise
     payload["backup"] = str(backup)
+    payload["created"] = [str(path) for path in created_links]
     return payload
 
 
 def cmd_migrate(args: argparse.Namespace, lib: Library) -> None:
-    emit(migrate_core(lib, lexical_path(args.source), args.scope, args.project, args.apply))
+    validation = validate_skill(lexical_path(args.source), require_dir_name=False)
+    if validation.get("valid") and validation.get("name") == "skills-manager":
+        fail("Use initialize --source <path> --host <host> for Skills Manager itself")
+    emit(
+        migrate_core(
+            lib,
+            lexical_path(args.source),
+            args.scope,
+            getattr(args, "project", None),
+            args.apply,
+            host=getattr(args, "host", None),
+            workspace=getattr(args, "workspace", None),
+            state_dir=getattr(args, "state_dir", None),
+            profile_home=getattr(args, "profile_home", None),
+        )
+    )
 
 
 def cmd_initialize_manager(args: argparse.Namespace, lib: Library) -> None:
+    requested_host = getattr(args, "host", None)
+    if requested_host is not None:
+        normalized_host(requested_host)
+    if getattr(args, "state_dir", None) or getattr(args, "profile_home", None):
+        fail(
+            "Skills Manager always uses the ~/.agents/skills bootstrap; "
+            "--state-dir and --profile-home do not apply"
+        )
     canonical = lib.skill_path("skills-manager")
     canonical_validation = validate_skill(canonical) if canonical.exists() else {"valid": False}
     if (
@@ -1126,30 +2422,131 @@ def cmd_initialize_manager(args: argparse.Namespace, lib: Library) -> None:
         source = canonical
     else:
         source = lexical_path(args.source) if args.source else lexical_path(Path(__file__).parent.parent)
-    payload = migrate_core(lib, source, "global", None, args.apply, expected_name="skills-manager")
+    claude_link = manager_claude_link()
+    claude_status = link_status(claude_link, canonical)
+    claude_requested = requested_host == "claude-code"
+    source_is_claude_entry = (
+        (source == claude_link and source.is_dir() and not source.is_symlink())
+        or (claude_link.is_symlink() and resolved(claude_link) == resolved(source))
+    )
+    if (
+        claude_requested
+        and claude_status.startswith("conflict")
+        and not source_is_claude_entry
+    ):
+        fail(f"Claude Code compatibility entry conflict at {claude_link}: {claude_status}")
+
+    bootstrap_status = link_status(GLOBAL_SKILLS_DIR / "skills-manager", canonical)
+    payload = migrate_core(
+        lib,
+        source,
+        "global",
+        None,
+        args.apply,
+        expected_name="skills-manager",
+        host=None,
+        additional_hosts=("claude-code",) if claude_requested else (),
+    )
     payload["action"] = "initialize-manager"
+    payload["host"] = "bootstrap"
+    payload["requested_host"] = requested_host
+    payload["bootstrap"] = {
+        "link": str(GLOBAL_SKILLS_DIR / "skills-manager"),
+        "status": (
+            link_status(GLOBAL_SKILLS_DIR / "skills-manager", canonical)
+            if args.apply
+            else bootstrap_status
+        ),
+        "target": str(canonical),
+    }
+    claude_detected = claude_code_detected()
+    claude_compatibility: dict[str, Any] = {
+        "detected": claude_detected,
+        "requested": claude_requested,
+        "link": str(claude_link),
+        "status": claude_status,
+        "offer": bool(
+            claude_detected
+            and not claude_requested
+            and claude_status != "already-correct"
+        ),
+        "created": [],
+    }
+    if claude_requested and args.apply:
+        claude_compatibility["created"] = [
+            path for path in payload.get("created", []) if path == str(claude_link)
+        ]
+        claude_compatibility["status"] = link_status(claude_link, canonical)
+    payload["claude_compatibility"] = claude_compatibility
     if args.apply:
-        payload["next_step"] = "Use the canonical Skill on the next turn; restart Codex if it does not appear."
+        if claude_requested:
+            payload["next_step"] = (
+                "Use Skills Manager through the Claude Code compatibility entry on the next turn; "
+                "restart Claude Code if it does not appear."
+            )
+        elif claude_compatibility["offer"]:
+            payload["next_step"] = (
+                "Skills Manager is installed through the shared bootstrap. Claude Code was detected; "
+                "ask whether to create its compatibility entry before running initialize "
+                "--host claude-code."
+            )
+        else:
+            payload["next_step"] = (
+                "Use Skills Manager through the shared bootstrap on the next turn; "
+                "restart the agent client if it does not appear."
+            )
     emit(payload)
 
 
 def cmd_unexpose(args: argparse.Namespace, lib: Library) -> None:
     target = lib.skill_path(args.skill)
-    link, project_root = scope_link(args.skill, args.scope, args.project)
+    host = normalized_host(getattr(args, "host", None))
+    if args.skill == "skills-manager" and host == "legacy":
+        fail("The ~/.agents/skills/skills-manager bootstrap is reserved and cannot be unexposed")
+    link, project_root = scope_link(
+        args.skill,
+        args.scope,
+        getattr(args, "project", None),
+        host,
+        getattr(args, "workspace", None),
+        getattr(args, "state_dir", None),
+        getattr(args, "profile_home", None),
+    )
     state = lib.load_state()
-    recorded = str(link) in state["exposures"]
+    recorded_item = state["exposures"].get(str(link))
+    recorded = recorded_item is not None
+    if (
+        host == "codex"
+        and args.scope == "project"
+        and not recorded_item
+        and state["skill_scopes"].get(args.skill) == "project"
+    ):
+        fail(
+            f"Cannot prove Codex ownership of {link}; legacy project state exists. "
+            "Migrate or clear the legacy binding explicitly first"
+        )
+    if recorded_item and recorded_item.get("host", "legacy") != host:
+        fail(
+            f"Exposure at {link} belongs to host {recorded_item.get('host', 'legacy')!r}, "
+            f"not {host!r}"
+        )
     if not lexists(link):
         payload = {
             "action": "unexpose",
             "apply": args.apply,
             "skill": args.skill,
+            "host": host,
             "link": str(link),
             "result": "missing-link",
             "clear_stale_record": recorded,
+            "clear_legacy_scope": host == "legacy" and args.skill in state["skill_scopes"],
             "scope_marker": state["skill_scopes"].get(args.skill),
         }
-        if args.apply and recorded:
+        if args.apply and (recorded or (host == "legacy" and args.skill in state["skill_scopes"])):
             state["exposures"].pop(str(link), None)
+            remove_installation_for_link(state, args.skill, link, host)
+            if host == "legacy":
+                clear_legacy_scope_if_unexposed(state, args.skill)
             lib.ensure_layout()
             lib.save_state(state)
         emit(payload)
@@ -1162,11 +2559,13 @@ def cmd_unexpose(args: argparse.Namespace, lib: Library) -> None:
         "action": "unexpose",
         "apply": args.apply,
         "skill": args.skill,
+        "host": host,
         "scope": args.scope,
         "project": str(project_root) if project_root else None,
         "link": str(link),
         "target": str(target),
         "scope_marker": state["skill_scopes"].get(args.skill),
+        "clear_legacy_scope": host == "legacy" and args.skill in state["skill_scopes"],
     }
     if args.apply:
         link_removed = False
@@ -1174,6 +2573,9 @@ def cmd_unexpose(args: argparse.Namespace, lib: Library) -> None:
             link.unlink()
             link_removed = True
             state["exposures"].pop(str(link), None)
+            remove_installation_for_link(state, args.skill, link, host)
+            if host == "legacy":
+                clear_legacy_scope_if_unexposed(state, args.skill)
             lib.ensure_layout()
             lib.save_state(state)
         except Exception as exc:
@@ -1201,6 +2603,8 @@ def group_memberships(lib: Library, skill: str) -> list[str]:
 
 def cmd_remove(args: argparse.Namespace, lib: Library) -> None:
     name = validate_identifier(args.skill, "Skill name")
+    if name == "skills-manager":
+        fail("Skills Manager is reserved; repair its bootstrap instead of removing it")
     target = lib.skill_path(name)
     if not target.is_dir() or target.is_symlink():
         fail(f"Canonical Skill is missing or not a real directory: {target}")
@@ -1211,9 +2615,16 @@ def cmd_remove(args: argparse.Namespace, lib: Library) -> None:
     global_link = GLOBAL_SKILLS_DIR / name
     if link_status(global_link, target) == "already-correct":
         exposure_paths.add(str(global_link))
+    for host in SUPPORTED_HOSTS:
+        host_link, _ = scope_link(name, "global", None, host)
+        if link_status(host_link, target) == "already-correct":
+            exposure_paths.add(str(host_link))
+    installations = state["installations"].get(name, [])
     memberships = group_memberships(lib, name)
     if exposure_paths:
         fail(f"Remove active or recorded exposures first: {sorted(exposure_paths)}")
+    if installations:
+        fail(f"Remove host installations first: {installations}")
     if memberships:
         fail(f"Remove Skill from groups first: {memberships}")
     backup = lib.backup_path(name, "remove")
@@ -1224,6 +2635,7 @@ def cmd_remove(args: argparse.Namespace, lib: Library) -> None:
         "target": str(target),
         "backup": str(backup),
         "scope": state["skill_scopes"].get(name),
+        "installations": installations,
         "permanent_delete": False,
     }
     if args.apply:
@@ -1234,6 +2646,7 @@ def cmd_remove(args: argparse.Namespace, lib: Library) -> None:
             target_moved = True
             record_backup(state, backup, target, "remove")
             state["skill_scopes"].pop(name, None)
+            state["installations"].pop(name, None)
             lib.save_state(state)
         except Exception as exc:
             if target_moved:
@@ -1390,26 +2803,58 @@ def cmd_group_expose(args: argparse.Namespace, lib: Library) -> None:
     manifest = parse_group(lib.group_path(args.group))
     if not manifest["skills"]:
         fail(f"Group {args.group!r} has no Skills")
-    items, project_root = plan_exposures(lib, manifest["skills"], args.scope, args.project)
+    if "skills-manager" in manifest["skills"]:
+        fail("Skills Manager cannot be exposed through a group; use initialize --host <host>")
+    host = normalized_host(getattr(args, "host", None))
+    items, project_root = plan_exposures(
+        lib,
+        manifest["skills"],
+        args.scope,
+        getattr(args, "project", None),
+        host,
+        getattr(args, "workspace", None),
+        getattr(args, "state_dir", None),
+        getattr(args, "profile_home", None),
+    )
     payload = {
         "action": "group-expose",
         "apply": args.apply,
         "group": args.group,
+        "host": host,
         "scope": args.scope,
         "project": str(project_root) if project_root else None,
         "links": [
-            {"skill": item["skill"], "link": str(item["link"]), "target": str(item["target"]), "status": item["status"]}
+            {
+                "skill": item["skill"],
+                "link": str(item["link"]),
+                "target": str(item["target"]),
+                "status": item["status"],
+                "requirements": item["requirements"],
+            }
             for item in items
         ],
     }
     if args.apply:
         lib.ensure_layout()
-        payload["created"] = apply_exposures(lib, items, args.scope, project_root)
+        payload["created"] = apply_exposures(lib, items, args.scope, project_root, host)
     emit(payload)
 
 
 def cmd_doctor(args: argparse.Namespace, lib: Library) -> None:
     issues: list[dict[str, str]] = []
+    notices: list[dict[str, str]] = []
+    if lib.staging.is_dir():
+        for rollback in sorted(lib.staging.glob(".replace-rollback-v1-*")):
+            issues.append(
+                {
+                    "type": "replacement-rollback-cleanup-pending",
+                    "path": str(rollback),
+                    "detail": (
+                        "A transaction-only replacement rollback copy was not deleted; "
+                        "inspect the successful replacement before removing it."
+                    ),
+                }
+            )
     for name in list_canonical_skills(lib):
         path = lib.skill_path(name)
         if path.is_symlink():
@@ -1428,6 +2873,19 @@ def cmd_doctor(args: argparse.Namespace, lib: Library) -> None:
             issues.append({"type": "invalid-group", "path": str(lib.group_path(group)), "detail": str(exc)})
     state = lib.load_state()
     canonical_names = set(list_canonical_skills(lib))
+    canonical_manager = lib.skill_path("skills-manager")
+    if "skills-manager" in canonical_names:
+        bootstrap_status = link_status(
+            GLOBAL_SKILLS_DIR / "skills-manager", canonical_manager
+        )
+        if bootstrap_status != "already-correct":
+            issues.append(
+                {
+                    "type": "manager-bootstrap-not-ready",
+                    "path": str(GLOBAL_SKILLS_DIR / "skills-manager"),
+                    "detail": bootstrap_status,
+                }
+            )
     for skill, scope in sorted(state["skill_scopes"].items()):
         if skill not in canonical_names:
             issues.append({"type": "scope-for-missing-skill", "path": str(lib.skill_path(skill))})
@@ -1453,18 +2911,146 @@ def cmd_doctor(args: argparse.Namespace, lib: Library) -> None:
                     "path": str(GLOBAL_SKILLS_DIR / skill),
                 }
             )
-    for skill in sorted(canonical_names - set(state["skill_scopes"])):
+        if skill != "skills-manager":
+            notices.append(
+                {
+                    "type": "legacy-binding-pending",
+                    "path": str(lib.skill_path(skill)),
+                    "detail": "Classify this legacy binding with an explicit host before cleanup.",
+                }
+            )
+
+    installed_names: set[str] = set()
+    for skill, records in sorted(state["installations"].items()):
+        if skill not in canonical_names:
+            issues.append({"type": "installation-for-missing-skill", "path": str(lib.skill_path(skill))})
+            continue
+        if not isinstance(records, list):
+            issues.append({"type": "invalid-installations", "path": str(lib.skill_path(skill))})
+            continue
+        if records:
+            installed_names.add(skill)
+        for record in records:
+            if not isinstance(record, dict):
+                issues.append({"type": "invalid-installation", "path": str(lib.skill_path(skill))})
+                continue
+            host = record.get("host")
+            scope = record.get("scope")
+            if skill == "skills-manager" and host != "claude-code":
+                notices.append(
+                    {
+                        "type": "obsolete-manager-host-installation",
+                        "path": str(record.get("link") or lib.skill_path(skill)),
+                        "detail": (
+                            "Skills Manager uses the shared bootstrap; only Claude Code needs "
+                            "a host compatibility installation."
+                        ),
+                    }
+                )
+            if host not in SUPPORTED_HOSTS:
+                issues.append(
+                    {
+                        "type": "invalid-installation-host",
+                        "path": str(lib.skill_path(skill)),
+                        "detail": str(host),
+                    }
+                )
+                continue
+            if scope not in SUPPORTED_SCOPES[host]:
+                issues.append(
+                    {
+                        "type": "invalid-installation-scope",
+                        "path": str(lib.skill_path(skill)),
+                        "detail": str(scope),
+                    }
+                )
+                continue
+            link_text = record.get("link")
+            if not link_text:
+                if scope == "global":
+                    issues.append(
+                        {
+                            "type": "global-installation-without-link",
+                            "path": str(lib.skill_path(skill)),
+                            "detail": str(host),
+                        }
+                    )
+                continue
+            recorded_exposure = state["exposures"].get(str(link_text))
+            if not recorded_exposure:
+                issues.append(
+                    {
+                        "type": "installation-without-exposure",
+                        "path": str(link_text),
+                        "detail": f"{host}:{scope}",
+                    }
+                )
+            elif recorded_exposure.get("host", "legacy") != host:
+                issues.append(
+                    {
+                        "type": "installation-exposure-host-mismatch",
+                        "path": str(link_text),
+                        "detail": f"{host} != {recorded_exposure.get('host', 'legacy')}",
+                    }
+                )
+
+    for skill in sorted(canonical_names - set(state["skill_scopes"]) - installed_names):
+        if (
+            skill == "skills-manager"
+            and link_status(GLOBAL_SKILLS_DIR / skill, lib.skill_path(skill)) == "already-correct"
+        ):
+            continue
         issues.append({"type": "unclassified-skill", "path": str(lib.skill_path(skill))})
     for link_text, item in state["exposures"].items():
         link = Path(link_text)
-        target = Path(item["target"])
+        target_text = item.get("target")
+        if not target_text:
+            issues.append({"type": "recorded-exposure-without-target", "path": link_text})
+            continue
+        target = Path(target_text)
+        skill_name = item.get("skill")
+        if (
+            skill_name == "skills-manager"
+            and item.get("host", "legacy") == "legacy"
+            and not is_reserved_manager_bootstrap_exposure(
+                link_text, item, canonical_manager
+            )
+        ):
+            notices.append(
+                {
+                    "type": "legacy-binding-pending",
+                    "path": link_text,
+                    "detail": (
+                        "Only the exact ~/.agents/skills/skills-manager bootstrap is reserved; "
+                        "inspect this additional legacy binding."
+                    ),
+                }
+            )
+        if skill_name in canonical_names and resolved(target) != resolved(lib.skill_path(skill_name)):
+            issues.append(
+                {
+                    "type": "recorded-target-is-not-canonical",
+                    "path": link_text,
+                    "detail": str(target),
+                }
+            )
+        host = item.get("host", "legacy")
+        scope = item.get("scope")
+        if host not in SUPPORTED_SCOPES or scope not in SUPPORTED_SCOPES[host]:
+            issues.append(
+                {
+                    "type": "invalid-recorded-exposure",
+                    "path": link_text,
+                    "detail": f"{host}:{scope}",
+                }
+            )
         if not lexists(link):
             issues.append({"type": "missing-recorded-link", "path": link_text})
         elif not link.is_symlink():
             issues.append({"type": "recorded-link-is-not-symlink", "path": link_text})
         elif resolved(link) != resolved(target):
             issues.append({"type": "redirected-link", "path": link_text, "detail": str(resolved(link))})
-    emit({"healthy": not issues, "issues": issues})
+    emit({"healthy": not issues, "issues": issues, "notices": notices})
     if issues:
         raise SystemExit(1)
 
@@ -1473,9 +3059,18 @@ def add_apply(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--apply", action="store_true", help="Apply the displayed mutation")
 
 
-def add_scope(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--scope", choices=("global", "project"), required=True)
+def add_scope(parser: argparse.ArgumentParser, *, host_required: bool = False) -> None:
+    parser.add_argument("--scope", choices=("global", "project", "agent"), required=True)
+    parser.add_argument(
+        "--host",
+        choices=SUPPORTED_HOSTS,
+        required=host_required,
+        help="Target agent host; omit only for legacy .agents compatibility",
+    )
     parser.add_argument("--project", help="Existing project or module root for project scope")
+    parser.add_argument("--workspace", help="Existing OpenClaw agent workspace for agent scope")
+    parser.add_argument("--state-dir", help="OpenClaw state directory override for global scope")
+    parser.add_argument("--profile-home", help="Hermes profile home override for global scope")
 
 
 def normalize_cli_args(argv: list[str]) -> list[str]:
@@ -1515,12 +3110,35 @@ def build_parser() -> argparse.ArgumentParser:
     validate.set_defaults(func=cmd_validate)
 
     discover = sub.add_parser("discover", help="Discover migration candidates in approved roots")
+    discover.add_argument(
+        "--host",
+        action="append",
+        choices=SUPPORTED_HOSTS,
+        help="Approved host to scan; repeat for multiple hosts (omit for legacy all-host behavior)",
+    )
+    discover.add_argument(
+        "--include-legacy",
+        action="store_true",
+        help="Also scan legacy .agents/skills after separate consent",
+    )
     discover.add_argument("--project", action="append", help="Additional project or module root")
+    discover.add_argument(
+        "--workspace",
+        action="append",
+        help="Approved OpenClaw agent workspace root; repeat as needed",
+    )
     discover.set_defaults(func=cmd_discover)
 
-    adopt = sub.add_parser("adopt", help="Copy a completed local Skill into the library")
+    adopt = sub.add_parser(
+        "adopt",
+        help="Adopt, reuse, or compare a completed local Skill with the library",
+    )
     adopt.add_argument("source")
-    adopt.add_argument("--replace", action="store_true", help="Replace an existing canonical copy with backup")
+    adopt.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace a differing canonical copy after confirmation; rollback copy is transaction-only",
+    )
     add_apply(adopt)
     adopt.set_defaults(func=cmd_adopt)
 
@@ -1532,9 +3150,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     set_scope = sub.add_parser("set-scope", help="Record the user-selected Skill classification")
     set_scope.add_argument("skills", nargs="+")
-    set_scope.add_argument("--scope", choices=("global", "project"), required=True)
+    add_scope(set_scope)
     add_apply(set_scope)
     set_scope.set_defaults(func=cmd_set_scope)
+
+    unset_scope = sub.add_parser(
+        "unset-scope", help="Remove one canonical-only host installation classification"
+    )
+    unset_scope.add_argument("skills", nargs="+")
+    unset_scope.add_argument("--host", choices=SUPPORTED_HOSTS, required=True)
+    unset_scope.add_argument("--scope", choices=("global", "project", "agent"), required=True)
+    add_apply(unset_scope)
+    unset_scope.set_defaults(func=cmd_unset_scope)
 
     migrate = sub.add_parser("migrate", help="Move one real Skill directory into the library and expose it")
     migrate.add_argument("source")
@@ -1542,8 +3169,27 @@ def build_parser() -> argparse.ArgumentParser:
     add_apply(migrate)
     migrate.set_defaults(func=cmd_migrate)
 
-    initialize = sub.add_parser("initialize", help="Initialize and globally link skills-manager itself")
+    initialize = sub.add_parser(
+        "initialize",
+        help="Initialize the shared Skills Manager bootstrap and optional Claude entry",
+    )
     initialize.add_argument("--source", help="Currently active skills-manager directory")
+    initialize.add_argument(
+        "--host",
+        choices=SUPPORTED_HOSTS,
+        help=(
+            "Requesting host; claude-code creates its compatibility entry, while other hosts "
+            "keep only the shared bootstrap"
+        ),
+    )
+    initialize.add_argument(
+        "--state-dir",
+        help="Retained for CLI compatibility; rejected because initialization uses the bootstrap",
+    )
+    initialize.add_argument(
+        "--profile-home",
+        help="Retained for CLI compatibility; rejected because initialization uses the bootstrap",
+    )
     add_apply(initialize)
     initialize.set_defaults(func=cmd_initialize_manager)
 
@@ -1552,6 +3198,15 @@ def build_parser() -> argparse.ArgumentParser:
     add_scope(unexpose)
     add_apply(unexpose)
     unexpose.set_defaults(func=cmd_unexpose)
+
+    repair = sub.add_parser(
+        "repair",
+        help="Repair or register one host symlink without touching real directories",
+    )
+    repair.add_argument("skill")
+    add_scope(repair, host_required=True)
+    add_apply(repair)
+    repair.set_defaults(func=cmd_repair)
 
     remove = sub.add_parser("remove", help="Move an unused canonical Skill to recoverable backup")
     remove.add_argument("skill")

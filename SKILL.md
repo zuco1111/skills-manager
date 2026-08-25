@@ -1,197 +1,168 @@
 ---
 name: skills-manager
-description: Install and manage standalone agent Skills across compatible Skill-based environments—not plugins or bundled/system/plugin-cache Skills—through a central SkillsLibrary with mandatory global-or-project scope selection and default functional-overlap checks that prevent ambiguous Skill routing. Use when users ask to initialize Skills Manager; install, import, migrate, list, classify, group, update, repair, expose, unlink, remove, deduplicate, compare, or inspect functionally similar Skills; preinstall project Skills before a project exists; install named Skill groups such as "backend skills"; or ask about Skills Manager features and documentation. Store canonical copies in SkillsLibrary and expose them with symlinks. Use skill-creator, not this Skill, to author Skill content.
+description: Manage standalone agent Skills across Codex, Claude Code, OpenClaw, and Hermes using one canonical SkillsLibrary and host-specific symlinks. Use when users ask to install or uninstall a Skill; make it available to or remove it from an agent; import, migrate, list, group, update, repair, or change its user/project/profile/shared/agent scope; reuse an installed Skill; resolve duplicate or conflicting versions; inspect functional overlap; or initialize or repair Skills Manager. Exclude plugins and bundled, system, administrator, or plugin-cache Skills. Use skill-creator to author content and low-level installers only to fetch or stage sources.
 ---
 
 # Skills Manager
 
-Manage canonical Skill copies in a central library and expose them through scoped directory symlinks. Keep the workflow interactive at decision points and deterministic for filesystem operations.
+Keep one canonical copy of every managed Skill and expose it independently to each compatible agent host. Keep decisions interactive and filesystem changes deterministic.
+
+## Core model
+
+- Store canonical directories only under `$HOME/SkillsLibrary/skills/<skill-name>` unless the user explicitly configured another library root.
+- Treat an installation as a host-aware exposure record plus, when a destination exists, a symlink to the canonical directory. Never create a second canonical copy for another host.
+- A Skill may be installed for multiple hosts with different scopes. Changing or removing one host installation must not change another.
+- Use `--host codex|claude-code|openclaw|hermes` for every new host-aware operation. Omitting `--host` retains legacy `$HOME/.agents/skills` behavior only for compatibility; never choose that path for a new installation.
+- Reserve one exception for Skills Manager itself: always keep `$HOME/.agents/skills/skills-manager` as the shared bootstrap symlink to its canonical directory. Do not migrate, unexpose, or replace that bootstrap with a Codex, OpenClaw, or Hermes user entry. Claude Code gets an additional compatibility entry only when explicitly requested.
+
+Use these host/scope mappings:
+
+| Host | User-wide scope | Project or agent scope |
+|---|---|---|
+| Codex | `global` -> `${CODEX_HOME:-$HOME/.codex}/skills/` | `project` -> `<root>/.agents/skills/` |
+| Claude Code | `global` -> `$HOME/.claude/skills/` | `project` -> `<root>/.claude/skills/` |
+| OpenClaw | `global` -> `${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/skills/` | `agent` -> `<agent-workspace>/skills/` |
+| Hermes | `global` -> `${HERMES_HOME:-$HOME/.hermes}/skills/` | `project` -> `<root>/.hermes/skills/` |
+
+`--state-dir` may override the OpenClaw shared state root, `--workspace` selects an OpenClaw agent workspace, and `--profile-home` may override the Hermes profile root.
+
+An exposure plan may also report runtime requirements. `openclaw-allow-symlink-target` means OpenClaw must trust the exact canonical target before loading an agent-workspace symlink. `hermes-project-trust` means Hermes must trust the named project before loading its project Skill. The script reports these requirements but does not edit either runtime's configuration.
 
 ## Non-negotiable rules
 
-- Keep canonical Skill directories under `$HOME/SkillsLibrary/skills/` unless the user explicitly configured another library root.
-- Expose global Skills through `$HOME/.agents/skills/<skill-name>`.
-- Expose project or module Skills through `<user-provided-root>/.agents/skills/<skill-name>`.
-- Before every single-Skill or group installation, ask whether it is **global** or **project-level**. A batch or group needs one scope question for the whole transaction unless the user requests mixed scopes.
-- After project-level is selected, ask whether an existing project or module root is available now. If it is, accept the root directory, create `.agents/skills/` beneath it, and never require the user to provide that nested directory. If it is not, keep the canonical copy in the library, mark its user-selected scope as `project`, and create no symlink. Do not add a separate pending or binding marker.
-- Do not infer a project path. When linking now, require an existing directory and confirm the exact normalized path before mutation. A missing project path is valid for a project-level preinstallation that only writes the canonical library copy.
-- Do not ask whether to add a newly installed Skill to a group. Add group membership only when the user explicitly requests it.
-- Never initialize Git automatically and never ask about Git during normal onboarding. Only initialize or modify Git when explicitly requested.
-- Keep functional-overlap checks enabled by default unless the user explicitly disables them. Use them to prevent ambiguous Skill routing, not to detect filesystem copies. Never merge or remove Skills automatically.
-- Never overwrite a real directory, conflicting symlink, canonical Skill, or group manifest without showing the conflict and receiving explicit confirmation for the selected resolution.
-- Exclude bundled system Skills, administrator Skills, and plugin-managed cache directories from migration by default.
-- Run a dry run before every mutating script command. Explicit migration consent authorizes conflict-free migrations, and a completed initial overlap review authorizes its bookkeeping marker. For other mutations, run the same command with `--apply` only after the user confirms the exact plan.
+- Determine the target host before choosing scope. In a recognized host, use the current host without asking the ordinary user to select it; if the user explicitly names another host, honor that host. If the runtime host is unknown, ask which supported host to target. If the requested host is incompatible, explain why and stop before mutation.
+- Ask for the valid scope for that host before each single-Skill, batch, or group installation. Ask once per host transaction unless the user requests mixed targets.
+- For Codex, Claude Code, or Hermes project scope, ask whether an existing project/module root is available. For OpenClaw agent scope, ask whether an existing agent workspace is available. Accept the root, not its nested Skills directory, and confirm its normalized path before linking.
+- When a selected project/module root or OpenClaw agent workspace does not yet exist, adopt and validate the canonical copy, record the selected host and scope without an exposure, and create no placeholder directory or separate pending flag.
+- For an explicitly confirmed user-wide/global installation, allow the standard host discovery directory to be created. Host executable detection is not a prerequisite; Claude Code detection affects only the optional Skills Manager compatibility offer. Use canonical-only `set-scope` instead only when the user explicitly wants no discovery directory yet.
+- Do not infer project, module, workspace, state, or profile roots.
+- Do not ask whether to add a newly installed Skill to a group. Add membership only on explicit request.
+- Treat low-level installers as source acquisition only. Stage outside the canonical library and host discovery paths; Skills Manager owns final adoption, version choice, host scope, and exposure.
+- Never initialize Git automatically or mention Git during normal onboarding.
+- Keep functional-overlap checks enabled by default. Use them to prevent ambiguous routing, never to infer filesystem duplication, and never merge or remove Skills automatically.
+- Never overwrite a real directory, conflicting symlink, canonical Skill, installation record, or group manifest without displaying the conflict and receiving explicit confirmation for the chosen resolution.
+- When the same canonical Skill name already exists, compare its content before adoption. Reuse byte-equivalent content without copying it again. If content differs, show the comparison and every affected host installation, then ask **use existing**, **use incoming**, or **cancel**. Never select a version implicitly.
+- Exclude bundled system Skills, administrator Skills, and plugin-managed caches from migration by default.
+- Run a dry run before every mutating script command. Migration consent authorizes only the displayed conflict-free migration plan; all other mutations require confirmation of the exact plan before repeating the command with `--apply`.
+- Never silently reinterpret version-1 `skill_scopes` or legacy `$HOME/.agents/skills` exposures as Codex, Claude Code, OpenClaw, or Hermes installations. Migration requires a dry run, an explicit host/scope mapping, and confirmation.
+- Inspect every returned `requirements` entry. A created symlink is not yet usable when a runtime requirement remains unmet; report it, identify the exact target or project, and do not claim availability until the host's trust or allowlist requirement is completed.
 
-## Load the feature guide when needed
+## Load detailed guidance selectively
 
-Read [references/user-guide.md](references/user-guide.md) completely when the user asks what this Skill supports, requests documentation, asks how groups or migration work, or needs examples. Answer in the user's language.
+Use the table of contents in [references/user-guide.md](references/user-guide.md) and read only the sections required by the task:
+
+- Read sections 1–4 for the canonical model, host paths, discovery, or scope selection.
+- Read section 5 for initialization, Claude compatibility, or legacy migration.
+- Read sections 6–8 for installation, version reuse, overlap, batches, or groups.
+- Read sections 9–10 for updates, uninstallation, scope changes, removal, repair, or safety.
+- Read sections 11–12 for examples or documented limitations.
+
+Read the complete guide only when a request spans several areas or reviews the Skill itself. Answer in the user's language.
 
 ## Start every workflow
 
 1. Resolve this Skill's actual directory from the active Skill path.
-2. Run `python3 scripts/skills_manager.py status`.
-3. If `canonical_manager_valid` is `false` or `global_manager_link_status` is not `already-correct`, immediately tell the user that Skills Manager must be initialized before use. Offer to initialize it now and follow **Initialization** before managing other Skills.
-4. If `overlap.enabled` is `true` and `overlap.initial_scan_done` is `false`, follow **Functional overlap checks** and complete the one-time canonical scan before the requested operation.
-5. If `migration_status` is `not-asked`, ask whether the user wants to scan existing user-level Skills for migration. Record the answer with `mark-migration`; do not scan before consent.
-6. Identify the requested operation and follow the relevant workflow below.
+2. Resolve the current or explicitly requested host. Clarify an unknown host before any mutation.
+3. Run `python3 scripts/skills_manager.py status` and inspect the canonical manager, host-aware `installations`, legacy state, overlap state, and migration state.
+4. If the canonical manager or shared bootstrap is invalid, offer initialization before managing other Skills. A missing Claude Code compatibility entry matters only when Claude Code is the explicit target.
+5. If overlap checking is enabled and its initial scan is incomplete, follow **Functional overlap checks**.
+6. If migration has not been discussed, ask whether to scan the relevant host's existing user-level Skills and, separately, any legacy Skills Manager entries. Pass one `--host` per approved host, add only user-supplied `--project` or `--workspace` roots, and use `--include-legacy` only after separate consent.
+7. Follow the requested workflow.
 
 ## Initialization
 
-Use initialization when this Skill was installed outside the canonical library or `status` reports an invalid canonical manager or an incorrect global manager link.
+1. Explain that initialization keeps the real copy at `$HOME/SkillsLibrary/skills/skills-manager` and always creates or verifies this shared bootstrap:
 
-1. Lead with a clear notice in the user's language: Skills Manager has been installed, but it must be initialized before it can be used.
-2. Explain that initialization will place the real copy at `$HOME/SkillsLibrary/skills/skills-manager` and create the global entry as a symlink.
-3. Show a dry run, passing the currently active Skill folder explicitly:
-
-   ```bash
-   python3 scripts/skills_manager.py initialize --source <active-skill-folder>
+   ```text
+   $HOME/.agents/skills/skills-manager
+       -> $HOME/SkillsLibrary/skills/skills-manager
    ```
 
-4. After confirmation, rerun with `--apply`.
-5. Report the canonical path, symlink path, and any recoverable backup path.
-6. Run the one-time canonical functional-overlap scan described below and record it only after semantic review is complete.
-7. Tell the user the initialized Skill will be used on the next turn; if it does not appear, restart the agent client.
+   This reserved bootstrap exception applies only to Skills Manager; all other Skills use the host matrix above.
+2. Dry-run with the active directory and an explicit host:
 
-The initialization command must be idempotent. It must validate the copied Skill before switching paths and roll back on failure. Keep any legacy CLI compatibility internal and do not surface its old name or terminology in user-facing messages.
+   ```bash
+   python3 scripts/skills_manager.py initialize --source <active-skill-folder> --host <host>
+   ```
+
+3. After confirmation, repeat with `--apply`.
+4. For `--host codex`, `openclaw`, or `hermes`, create no additional manager link or host installation record. Those hosts use the shared bootstrap or their supported external Skill discovery/configuration.
+5. For an explicit `--host claude-code`, create `$HOME/.claude/skills/skills-manager` in the same transaction as the bootstrap and record only that compatibility installation.
+6. When another host requested initialization and status reports `claude_compatibility.offer: true`, explain that a Claude Code executable was detected and ask whether the user also wants the Claude compatibility entry. Detection is advisory only: never create it until the user agrees, then dry-run `initialize --host claude-code` and obtain confirmation before `--apply`.
+7. Report the canonical path, bootstrap, optional Claude compatibility entry, and recoverable backup if one was created. Complete the one-time overlap review; restart the relevant client if discovery is delayed.
+
+Initialization must validate before switching paths and roll back on failure.
 
 ## Functional overlap checks
 
-Treat functional overlap as a routing-conflict check. The script only returns broad lexical candidates; the Agent makes the semantic decision.
+The script supplies broad lexical candidates; the Agent makes the semantic decision.
 
-1. Run `python3 scripts/skills_manager.py overlap scan` for the one-time canonical scan, or add one repeated `--candidate <skill-directory>` for each staged, local, imported, or migrating candidate.
-2. Use `lexical_candidates` as the priority list, then review the `scanned_items` names and descriptions for obvious semantic equivalents that share few literal words. Compare only plausible same-object items; do not perform a full body review of unrelated Skills. If `name` and `description` are insufficient for a plausible pair, read only the bodies of those two `SKILL.md` files; do not inspect other bundled files for this decision.
-3. Mark a pair highly overlapping only when all four conditions hold:
-   - both Skills operate on the same object;
-   - their core actions overlap or one contains the other;
-   - common user requests would plausibly trigger both;
-   - no clear routing boundary distinguishes them.
-4. Warn when one Skill is a capability subset of the other. Do not warn merely because Skills share a domain while performing different actions.
-5. If no pair is highly overlapping, continue without adding an overlap confirmation.
-6. If any pair is highly overlapping, show all affected pairs together. For each pair, include both descriptions, scope, exposures, group memberships, the overlap, the meaningful differences, and the routing risk. Include the exact dependency cleanup and backup consequence under **keep new**. Ask the user to choose **keep both**, **keep existing**, **keep new**, or **cancel** for each affected candidate. For a canonical-only scan, use the actual Skill names instead of ambiguous existing/new labels.
-7. Apply the choice safely:
-   - **Keep both:** continue without merging either Skill.
-   - **Keep existing:** skip the new candidate and continue unaffected batch items.
-   - **Keep new:** first adopt, validate, and expose the new Skill using the user-selected scope. Then execute only the displayed cleanup plan for the existing Skill, removing group memberships before exposures and using `remove` for a recoverable backup. If project scope was selected without an existing root, do not clean up the existing Skill; keep it active and defer retirement until the new Skill can be exposed in a supplied project root. If cleanup fails, keep the new Skill active, report exactly which old dependencies or canonical paths remain, and offer the normal repair workflow. Do not claim an atomic switchover and do not request a second confirmation for the same exact plan.
-   - **Cancel:** stop the affected installation or import; do not alter either Skill.
+1. Run `overlap scan`, adding one `--candidate <skill-directory>` per staged, local, imported, or migrating candidate.
+2. Prioritize `lexical_candidates`, then inspect names and descriptions for plausible same-object equivalents. Read only the two `SKILL.md` bodies when metadata is insufficient.
+3. Mark high overlap only when both Skills operate on the same object, their core actions overlap or one contains the other, common requests could trigger both, and no clear routing boundary separates them.
+4. If overlap is high, show both descriptions, every host installation and exposure, group memberships, meaningful differences, routing risk, and the exact cleanup/backup consequence. Ask **keep both**, **keep existing**, **keep new**, or **cancel**.
+5. For **keep new**, expose and validate the replacement first, then clean up only the installations and memberships in the approved plan. When the new destination is unavailable, keep the existing Skill active until the replacement can be exposed. Report partial cleanup accurately; never claim an atomic switchover.
 
-Never infer high overlap from the script's lexical score alone. Keep same-name collisions and replacements in the normal conflict or update workflows.
+Never infer overlap from lexical score alone. Treat same-name collisions as conflicts or updates. After the initial semantic review, dry-run then apply `overlap mark-initial-scan`; no second prompt is needed when the completed review found no high overlap. Change overlap settings only after explicit confirmation.
 
-After completing the post-initialization semantic review, dry-run `overlap mark-initial-scan`, then apply this bookkeeping update without a separate prompt when no high overlap exists. If high overlap exists, include the marker in the consolidated decision plan. To change the default, dry-run `overlap set on|off`, then apply it after explicit user confirmation.
+## Install or import Skills
 
-## Install or import one Skill
-
-1. Ask the mandatory scope question: global or project-level.
-2. For project-level, ask whether a project or module root exists now. If yes, ask for and confirm it. If no, confirm that only the canonical library copy will be installed and no link will be created yet.
-3. Resolve and validate the source:
-   - For an OpenAI curated Skill or GitHub source, use the available `skill-installer` workflow to create a temporary staged Skill outside the canonical destination. Do not expose or promote it yet.
-   - For a local completed Skill, use the source directory as the candidate.
-   - For a newly authored Skill, let `skill-creator` finish and validate its contents first, then treat that directory as a local candidate.
-4. Run `overlap scan --candidate <skill-directory>` and complete the semantic review before any `adopt`, canonical promotion, or exposure. If the check is disabled, report that it was skipped and continue.
-5. For an approved local or staged candidate, run `adopt <source>` as a dry run, then `adopt <source> --apply` after confirmation.
-6. Validate the canonical directory:
+1. Resolve the host and ask for a host-compatible scope. For multiple hosts, make a separate target plan for each while reusing the same canonical Skill.
+2. Obtain and confirm the destination root when linking now; otherwise confirm a canonical-only host/scope installation.
+3. Stage remote Skills outside the canonical destination with the available installer, or identify a completed local Skill. Let `skill-creator` finish authoring first.
+4. Dry-run `adopt <source>` to check the canonical inventory and content fingerprint.
+   - If it reports `content-identical`, reuse the existing canonical directory and do not copy or replace anything.
+   - If it reports `version-choice-required`, show the changed paths and all affected installations. Ask **use existing**, **use incoming**, or **cancel**. Using existing continues only with the requested host exposure. Using incoming requires a separate dry-run of `adopt <source> --replace`; warn that every host installation switches together.
+   - If no canonical copy exists, continue with the normal adoption plan.
+5. Run the overlap scan and semantic review when introducing new canonical content. Confirm and apply the exact adoption or replacement dry run, then validate the canonical directory. A replacement rollback copy exists only during the transaction and is deleted after canonical fingerprint, state write, and previously correct link checks succeed. Report `cleanup_pending` as an error requiring inspection; do not call runtime availability validated.
+6. Dry-run the applicable exposure, always passing `--host`:
 
    ```bash
-   python3 scripts/skills_manager.py validate <canonical-skill-directory>
+   python3 scripts/skills_manager.py expose <skill> --host codex --scope global
+   python3 scripts/skills_manager.py expose <skill> --host codex --scope project --project <root>
+   python3 scripts/skills_manager.py expose <skill> --host claude-code --scope project --project <root>
+   python3 scripts/skills_manager.py expose <skill> --host openclaw --scope agent --workspace <root>
+   python3 scripts/skills_manager.py expose <skill> --host hermes --scope global [--profile-home <root>]
    ```
 
-7. If a destination exists, show the exposure plan:
+7. Inspect the dry-run `requirements`. For OpenClaw agent scope, surface `openclaw-allow-symlink-target` and the exact canonical `target`. For Hermes project scope, surface `hermes-project-trust` and the exact `project`. Include these prerequisites in the confirmation plan.
+8. After confirmation, repeat with `--apply`. When a destination is unavailable, use host-aware `set-scope` to record the host/scope without a link.
+9. After linking, complete or have the user complete the reported runtime requirements through the relevant host's supported trust mechanism, then verify availability. Do not imply `skills_manager.py` changed OpenClaw or Hermes configuration. If a requirement remains, report the link as created but runtime access as pending.
+10. For a batch, scan all candidates together and preflight every canonical and exposure path before mutation. A conflict stops only the affected migration item, but stops a normal batch before partial installation.
 
-   ```bash
-   python3 scripts/skills_manager.py expose <skill-name> --scope global
-   python3 scripts/skills_manager.py expose <skill-name> --scope project --project <root>
-   ```
+A canonical-only installation is intentionally undiscoverable through that target until later exposure. An invalid Skill remains unexposed.
 
-8. After confirmation, repeat the applicable exposure command with `--apply`; exposure records the selected scope. If the project does not exist yet, skip exposure and record the user's classification instead:
+## Discovery across hosts
 
-   ```bash
-   python3 scripts/skills_manager.py set-scope <skill-name> --scope project
-   python3 scripts/skills_manager.py set-scope <skill-name> --scope project --apply
-   ```
+Host-aware installation records describe what Skills Manager created; they do not disable discovery rules implemented by an agent runtime. In particular, when OpenClaw or Hermes operates in the same project as Codex, it may discover the project's `.agents/skills/` entries after its trust and eligibility checks. This is expected and requires no extra registration or blocking configuration. If it uses another workspace or is not running in that project, it does not discover those project entries.
 
-   The installation is complete once the canonical copy is valid and its scope is marked.
-9. A project-level Skill without a project link is intentionally undiscoverable by agents until the user later supplies a root; then use `expose --scope project --project <root>`.
-10. Do not ask about group membership unless the user already requested a group operation.
+Do not convert that shared project discovery into a duplicate OpenClaw or Hermes installation record. User-wide host directories remain isolated.
 
-If installation produces an invalid Skill, leave it unexposed and report the validation errors.
+## List, groups, and lifecycle operations
 
-## Install multiple Skills
+- **List:** Use `status` to report the complete canonical inventory and `installation_status` for every host/scope link or canonical-only target. Use `doctor` when the user also asks for health diagnostics. Report legacy `skill_scopes` separately as unclassified legacy state until migrated.
+- **Groups:** Store manifests at `$HOME/SkillsLibrary/groups/<group>.yaml`. They contain canonical names, never copies or nested groups. Resolve the host and scope once, then use host-aware `group expose` to create one flat symlink per member. Inspect and satisfy each returned runtime requirement before calling the group usable.
+- **Update:** Start with `adopt <source>`. Reuse identical content. For differing content, obtain the user's version choice; only **use incoming** proceeds to a confirmed dry-run and apply of `adopt <source> --replace`. Stable canonical paths preserve every correct host link, and the transaction-only rollback copy is deleted after local validation.
+- **Unexpose:** Remove only the selected host/scope symlink and installation exposure record. Never follow or remove the canonical target or another host's entry. The reserved Skills Manager bootstrap cannot be unexposed; its optional Claude compatibility entry can be.
+- **Unset canonical-only scope:** Use `unset-scope <skill>... --host <host> --scope <scope>` only for matching installations whose `link` is `null`. Dry-run first, then apply after confirmation. If an installation has a link, use `unexpose` instead.
+- **Scope change:** Preflight removal of the old host exposure or canonical-only scope and creation or classification of the new target as one explicit plan. Do not change installations for other hosts.
+- **Remove:** Refuse canonical removal while any installation remains, including a canonical-only `link: null` installation, or while any legacy exposure or group membership remains. Move the canonical directory to a recoverable backup only after all dependencies are cleared.
+- **Repair:** Run `doctor`; report invalid canonical Skills, broken or redirected recorded/managed host links, stale installation records, missing group members, incompatible host/scope pairs, and legacy state requiring migration. Use `discover` when the user wants to inspect unrecorded host directories. For a missing, redirected, or unrecorded symlink whose host/scope is known, dry-run `repair <skill> --host ... --scope ...`, confirm, then apply. It may create, repoint, or register only that symlink and refuses real directories. Handle canonical content, group manifests, and ambiguous state through their dedicated workflows rather than forcing a link repair.
 
-Ask for scope once for the batch. For project-level, ask whether one root exists now unless the user requests mixed destinations. Stage or identify every candidate, then run one `overlap scan` with repeated `--candidate` arguments and review all returned pairs together before mutation. Continue without an overlap confirmation when no pair is highly overlapping. If no project root is available, install and validate all approved canonical members, then mark the entire batch `project` with one `set-scope <skill>... --scope project` transaction without creating links. When a root is supplied, preflight every approved Skill and link before applying changes. If any member has a path conflict, stop the batch rather than leaving a partial installation.
+## Migration
 
-## List managed Skills
+Enter migration only after explicit consent. Run `discover` with one `--host` per approved host; add `--include-legacy` only after separate consent and add only user-supplied `--project` or OpenClaw `--workspace` roots. Omitting `--host` is legacy all-host compatibility and must not be used for a new scoped scan. Present candidates and exclusions. For each selected real directory, require a host and compatible scope, consolidate overlap review, dry-run the exact mapping, and apply only after the required confirmation.
 
-When the user asks which Skills are installed or available, list the complete canonical inventory from `SkillsLibrary/skills/`, not only the Skills the active agent can currently discover. Run `status` and present both classifications:
+Treat symlinks separately: register or repair links already targeting the library; inspect external targets before adoption. Continue conflict-free items when another migration item conflicts. Mark migration complete only after the final selected set succeeds.
 
-- **Global Skills:** canonical Skills carrying the user-selected `global` scope marker.
-- **Project-level Skills:** canonical Skills carrying the user-selected `project` scope marker, including Skills already linked into one or more projects and Skills preinstalled before any project exists.
-- **Unclassified Skills:** legacy or incomplete canonical entries without a marker; show them explicitly and ask for classification before the next scope-dependent operation.
+When explicit `migrate <legacy-real-directory> --host ...` succeeds, it removes a legacy exposure in the same transaction only when the source path exactly matches that exposure record. Clear the same-name legacy scope only when no other legacy exposure remains. A same-name `skill_scopes` marker without an exact source/exposure match is never removed; the dry run reports only `legacy_scope_present`. On failure, do not report either migration or legacy cleanup as complete. Never pass Skills Manager itself to `migrate`; use `initialize`, which preserves its reserved bootstrap and adds only an explicitly requested Claude compatibility entry.
 
-Treat the explicit marker as the source of truth. Use symlinks to validate whether the selected scope is correctly exposed, not to infer the user's classification. Include recorded project destinations as supplemental information when available. Do not omit a project-level Skill merely because the current project cannot discover it.
-
-## Manage groups
-
-Store group manifests at `$HOME/SkillsLibrary/groups/<group-name>.yaml`. A manifest refers to canonical Skill names and never contains copies.
-
-- Create: `group create <group>`
-- Inspect: `group show <group>` or `group list`
-- Add explicit members: `group add <group> <skill>...`
-- Remove members: `group remove <group> <skill>...`
-- Delete: `group delete <group>`
-- Install/expose all members: `group expose <group> --scope ...`
-
-Always dry-run mutations first. Do not support nested groups in version 1. A Skill may belong to multiple groups.
-
-When the user says "install backend skills", resolve `backend` as a group, show all members, and ask the mandatory scope question once. For a project-level installation, ask whether a root is available now. If yes, preflight the complete group, create one flat symlink per member inside the selected `.agents/skills/` directory, and mark every member `project`. If no, install and validate all canonical members, then mark every member `project` without creating links. Never link the group manifest or group directory itself.
-
-## Migrate existing Skills
-
-Only enter this workflow after explicit consent.
-
-1. Discover user-level candidates:
-
-   ```bash
-   python3 scripts/skills_manager.py discover
-   ```
-
-2. Include project candidates only when the user supplies project roots with `--project`.
-3. Present candidates and exclusions. Do not traverse arbitrary home or filesystem trees.
-4. For each real Skill directory selected by the user, ask global or project-level and, when needed, ask for the project root.
-5. Run one `overlap scan` with every selected real directory as a repeated candidate and complete the consolidated semantic review.
-6. Dry-run `migrate <source> --scope ...` for every remaining selected real directory before applying that item.
-7. Immediately rerun each conflict-free migration with `--apply`. The user's consent to migrate and selected scope or destination are sufficient authorization; do not ask for a second confirmation of the dry-run plan.
-8. Continue applying conflict-free items even when other selected items conflict. Present only the conflicting items for confirmation, with the conflict details and safe resolution choices. Do not include already applied or conflict-free items in that confirmation request.
-9. After the user resolves a conflict, apply only the approved resolution without reconfirming the whole migration set.
-10. Treat existing symlinks separately: if already pointing into the library, register or repair exposure; if pointing elsewhere, inspect the target and ask before adopting it.
-11. Mark migration `completed` only after the final user-selected set succeeds. If the user excludes a conflicting item, remove it from the selected set before marking completion. A declined first-run prompt does not disable later manual migration.
-
-## Update, unlink, remove, and repair
-
-- **Update:** Obtain a completed replacement directory, dry-run `adopt <source> --replace`, then apply after explicit confirmation. Canonical path stability keeps existing links intact.
-- **Unlink:** Use `unexpose`; remove only the selected symlink and never the canonical Skill.
-- **Scope change:** The user owns classification. Use `set-scope`; remove a global link before changing a Skill from `global` to `project`, and create the global link through `expose` when changing it to `global`.
-- **Preinstalled project Skill:** Its `project` scope marker is sufficient; it needs no separate pending or binding state. Keep the canonical copy until the user supplies a project root or explicitly removes it.
-- **Remove:** Use `remove`; refuse while recorded exposures, a live global link, or group memberships remain. Removal moves the canonical directory to a recoverable backup rather than permanently deleting it.
-- **Repair:** Run `doctor`. Show broken links, invalid or missing scope markers, scope/link contradictions, missing group members, and stale recorded exposures. Repair only the user-approved items.
-
-## Conflict handling
-
-For any collision, stop and show:
-
-- requested source and canonical destination;
-- existing target type and resolved path;
-- affected scope or project root;
-- safe choices: use existing, explicitly replace with backup, choose another name, or cancel.
-
-Never silently merge Skill folders. Do not delete a symlink target when unlinking. Do not treat a directory junction or an ordinary directory as a removable symlink.
-
-During migration, a collision stops only the affected item. Apply all other conflict-free selected items immediately, and ask the user only how to resolve or skip the conflicting item.
+For version-1 state, show every legacy classification and exposure, ask where it belongs, and keep it unchanged until the user confirms the dry-run migration. Never assume legacy `global` means Codex global or legacy `project` belongs to the current project.
 
 ## Script contract
 
-Use `scripts/skills_manager.py` for deterministic filesystem work. Commands are read-only by default where a mutation is possible and require `--apply` to change state. The script uses only the Python standard library, enforces the official frontmatter constraints needed for installation, writes state atomically, stages canonical replacements, retains recoverable backups, and rolls back newly created links, removed links, and moved canonical or group paths when a transaction fails.
+Use `scripts/skills_manager.py` for deterministic filesystem work. Mutations are dry-run by default and require `--apply`. The script uses only the Python standard library, validates supported frontmatter, writes state atomically, retains recoverable backups for migration/removal operations, and rolls back transaction changes on failure. Version replacement uses a transaction-only rollback copy that is deleted after successful local validation.
 
-After modifying the script, run `python3 scripts/test_skills_manager.py` and the bundled `skill-creator` `quick_validate.py` before accepting the change.
+After modifying the script, run `python3 scripts/test_skills_manager.py` and the bundled `skill-creator` `quick_validate.py`. Use `python3 scripts/skills_manager.py --help` for the exact command index.
 
-Run `python3 scripts/skills_manager.py --help` for the command index.
-
-The standard Agent installation workflow routes sources through staging, but direct invocation of low-level installer scripts, filesystem copies, and other workflows that bypass Skills Manager also bypass its overlap check. Do not claim Hook-level interception. When such Skills are later discovered, run a manual canonical overlap scan before the next managed installation decision.
+Low-level installers and filesystem copies can bypass Skills Manager and its overlap check. Do not claim Hook-level interception; scan externally placed Skills when they are later brought under management.
