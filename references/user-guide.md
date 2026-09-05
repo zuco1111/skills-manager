@@ -268,6 +268,10 @@ An explicit successful `migrate <legacy-real-directory> --host ...` transaction 
 
 Supported sources include OpenAI curated Skill names, GitHub repository paths or Skill URLs through an available installer, local completed Skill directories, and completed Skills produced by `skill-creator`. A low-level installer only fetches or stages source content outside the canonical library and host discovery paths. Skills Manager remains responsible for the canonical destination, version decision, host scope, and final exposure.
 
+Metadata validation reads and checks the required top-level `name` and `description`. All other fields, whether standard optional fields or vendor extensions such as `cli_version`, are preserved in the original file and ignored by the manager. They do not need an allowlist, field-specific validation, or a compatibility warning merely because they are unfamiliar. Adoption and migration preserve the file contents, including these fields; existing fingerprint and version-conflict checks still detect changes to them. The manager does not execute extension values, change permissions from them, or establish that the installed CLI satisfies a declared version requirement.
+
+Basic checks still require UTF-8, frontmatter delimiters, supported top-level key syntax, valid required fields, and the existing directory/path safeguards. This standard-library reader is not a complete YAML validator: it skips extension values and their continuations without checking their syntax or meaning. Host parsing and runtime compatibility remain separate from management validation.
+
 The normal sequence is:
 
 1. Resolve the current or requested host.

@@ -25,14 +25,7 @@ from typing import Any, Iterable
 
 
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-ALLOWED_FRONTMATTER_KEYS = {
-    "name",
-    "description",
-    "license",
-    "compatibility",
-    "allowed-tools",
-    "metadata",
-}
+REQUIRED_FRONTMATTER_KEYS = {"name", "description"}
 YAML_BOOLEAN_OR_NULL = {
     "null",
     "~",
@@ -226,9 +219,22 @@ def read_skill_metadata(skill_dir: Path) -> dict[str, str]:
         if not match:
             fail(f"Unsupported frontmatter syntax in {skill_file}: {line}")
         key, raw = match.group(1), match.group(2)
-        if key not in ALLOWED_FRONTMATTER_KEYS:
-            allowed = ", ".join(sorted(ALLOWED_FRONTMATTER_KEYS))
-            fail(f"Unexpected frontmatter key {key!r}; allowed keys: {allowed}")
+        if key not in REQUIRED_FRONTMATTER_KEYS:
+            # Extension values are opaque. Preserve the source file rather than
+            # parsing types, vendor schemas, version requirements, or permissions.
+            i += 1
+            while i < end:
+                continuation = lines[i]
+                if (
+                    not continuation.strip()
+                    or continuation.lstrip().startswith("#")
+                    or continuation[0].isspace()
+                    or re.match(r"^-(?:\s|$)", continuation)
+                ):
+                    i += 1
+                else:
+                    break
+            continue
         seen_keys.add(key)
         if raw in {">", "|", ">-", "|-"}:
             collected: list[str] = []
@@ -249,7 +255,7 @@ def read_skill_metadata(skill_dir: Path) -> dict[str, str]:
         if key in {"name", "description"}:
             values[key] = parse_yaml_string(raw, key)
         i += 1
-    missing = {"name", "description"} - seen_keys
+    missing = REQUIRED_FRONTMATTER_KEYS - seen_keys
     if missing:
         fail(f"Frontmatter is missing required keys: {sorted(missing)}")
     return values

@@ -1894,22 +1894,118 @@ class SkillsManagerTests(unittest.TestCase):
         self.assertIn("$HOME/.agents/skills/skills-manager", guide_text)
         self.assertIn("without a second Skills Manager registration", guide_text)
 
-    def test_validator_rejects_unexpected_frontmatter_key(self) -> None:
-        skill = self.lib.skills / "unexpected-key"
-        skill.mkdir()
-        (skill / "SKILL.md").write_text(
-            "---\n"
-            "name: unexpected-key\n"
-            "description: A valid description.\n"
-            "bogus-field: rejected\n"
-            "---\n",
-            encoding="utf-8",
+    def test_validator_ignores_extension_values_and_preserves_source(self) -> None:
+        skill = self.create_skill("extended-skill")
+        extensions = (
+            'cli_version: ">=1.0.15"\n',
+            "cli_version: null\n",
+            "custom-flag: true\n",
+            "custom-number: 42\n",
+            "custom-empty:\n",
+            "custom-list:\n  - first\n  - second\n",
+            "custom-list:\n- first\n- second\n",
+            "custom-map:\n  name: nested-name\n  description: nested description\n",
+            "custom-notes: |+\n  name: not-a-top-level-key\n  More notes.\n",
+            "custom-flow: [\n  first,\n  second]\n",
+            "metadata: &extra\n  category: vendor\n",
+            "compatibility: [custom, values]\n",
+            "allowed-tools:\n  - vendor-command\n",
+        )
+        for extension in extensions:
+            with self.subTest(extension=extension):
+                content = (
+                    "---\n"
+                    "before: ignored\n"
+                    "name: extended-skill\n"
+                    f"{extension}"
+                    "# The next required field is still read.\n"
+                    "description: A valid description.\n"
+                    "after: ignored\n"
+                    "---\n\n# Skill body\n"
+                ).encode("utf-8")
+                (skill / "SKILL.md").write_bytes(content)
+
+                result = manager.validate_skill(skill)
+
+                self.assertTrue(result["valid"], result["errors"])
+                self.assertEqual(result["name"], "extended-skill")
+                self.assertEqual(result["description"], "A valid description.")
+                self.assertEqual((skill / "SKILL.md").read_bytes(), content)
+
+    def test_extensions_do_not_bypass_required_field_validation(self) -> None:
+        skill = self.create_skill("required-fields")
+        cases = (
+            "description: A valid description.\n",
+            "name: required-fields\n",
+            "name: ''\ndescription: A valid description.\n",
+            "name: 123\ndescription: A valid description.\n",
+            "name: ../escape\ndescription: A valid description.\n",
+            "name: another-directory\ndescription: A valid description.\n",
+            "name: required-fields\ndescription: ''\n",
+            "name: required-fields\ndescription: null\n",
+            "name: required-fields\ndescription: [not, a, string]\n",
+            "name: required-fields\ndescription:\n  nested: value\n",
+        )
+        for required in cases:
+            with self.subTest(required=required):
+                (skill / "SKILL.md").write_text(
+                    "---\n"
+                    "custom-map:\n"
+                    "  name: required-fields\n"
+                    "  description: Nested fields cannot replace top-level fields.\n"
+                    f"{required}"
+                    "cli_version: ignored\n"
+                    "---\n",
+                    encoding="utf-8",
+                )
+                result = manager.validate_skill(skill)
+                self.assertFalse(result["valid"], required)
+
+    def test_extension_support_keeps_basic_frontmatter_checks(self) -> None:
+        skill = self.create_skill("bad-structure")
+        cases = (
+            b"name: bad-structure\ndescription: Missing delimiters.\n",
+            b"---\nname: bad-structure\ndescription: No closing delimiter.\n",
+            b"---\n  stray: indentation\nname: bad-structure\ndescription: Test.\n---\n",
+            b"---\ncustom: ignored\nmissing colon\nname: bad-structure\ndescription: Test.\n---\n",
+            b"---\nname: bad-structure\ndescription: Test.\ncustom: \xff\n---\n",
+        )
+        for content in cases:
+            with self.subTest(content=content):
+                (skill / "SKILL.md").write_bytes(content)
+                self.assertFalse(manager.validate_skill(skill)["valid"])
+
+    def test_migration_preserves_extension_fields_byte_for_byte(self) -> None:
+        project = self.root / "project"
+        source = project / ".agents" / "skills" / "vendor-skill"
+        source.mkdir(parents=True)
+        original = (
+            b'---\r\nname: vendor-skill\r\ncli_version: ">=1.0.15"\r\n'
+            b"vendor-data:\r\n  enabled: true\r\n  items: [one, two]\r\n"
+            b"description: A vendor skill.\r\n---\r\n\r\n# Original body\r\n"
+        )
+        (source / "SKILL.md").write_bytes(original)
+        state_before = self.lib.load_state()
+        args = Namespace(
+            source=str(source), host="codex", scope="project",
+            project=str(project), apply=False,
         )
 
-        result = manager.validate_skill(skill)
+        dry_run = self.capture_json(manager.cmd_migrate, args)
+        self.assertFalse(dry_run["apply"])
+        self.assertFalse(source.is_symlink())
+        self.assertFalse(self.lib.skill_path("vendor-skill").exists())
+        self.assertEqual((source / "SKILL.md").read_bytes(), original)
+        self.assertEqual(self.lib.load_state(), state_before)
 
-        self.assertFalse(result["valid"])
-        self.assertTrue(any("Unexpected frontmatter key" in error for error in result["errors"]))
+        args.apply = True
+        applied = self.capture_json(manager.cmd_migrate, args)
+        target = self.lib.skill_path("vendor-skill")
+        self.assertTrue(source.is_symlink())
+        self.assertEqual(source.resolve(), target.resolve())
+        for path in (source, target, Path(applied["backup"])):
+            self.assertEqual((path / "SKILL.md").read_bytes(), original)
+        self.assertTrue(manager.validate_skill(target)["valid"])
 
     def test_validator_accepts_block_description_and_metadata(self) -> None:
         skill = self.lib.skills / "block-description"
