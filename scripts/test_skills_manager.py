@@ -403,6 +403,43 @@ class SkillsManagerTests(unittest.TestCase):
             [{"scope": "codex-global", "path": str(self.home / ".codex" / "skills")}],
         )
 
+    def test_antigravity_discovery_includes_shared_sources_and_excludes_packaged_targets(self) -> None:
+        target = self.create_skill("demo")
+        gemini = self.home / ".gemini"
+        cli = gemini / "antigravity-cli"
+        for root in (cli / "skills", gemini / "config" / "skills", gemini / "skills"):
+            root.mkdir(parents=True)
+            (root / "demo").symlink_to(target)
+        builtin = cli / "builtin" / "skills" / "example"
+        builtin.mkdir(parents=True)
+        (builtin / "SKILL.md").write_text("---\nname: example\ndescription: Built in.\n---\n")
+        (cli / "skills" / "example").symlink_to(builtin)
+        payload = self.capture_json(manager.cmd_discover, Namespace(host=["antigravity"]))
+        self.assertEqual(len(payload["candidates"]), 3)
+        self.assertTrue(all(item["name"] == "demo" for item in payload["candidates"]))
+        with self.assertRaisesRegex(manager.ManagerError, "packaged Skill"):
+            manager.cmd_adopt(Namespace(source=str(builtin), apply=True), self.lib)
+        with self.assertRaisesRegex(manager.ManagerError, "packaged Skill"):
+            manager.cmd_migrate(Namespace(source=str(builtin), scope="global", host="antigravity", apply=True), self.lib)
+        self.assertTrue(builtin.is_dir())
+        (cli / "skills" / "demo").unlink()
+        with self.assertRaisesRegex(manager.ManagerError, "active or recorded exposures"):
+            manager.cmd_remove(Namespace(skill="demo", apply=True), self.lib)
+
+    def test_antigravity_project_reports_external_workspace_target(self) -> None:
+        target = self.create_skill("demo")
+        project = self.root / "project"
+        project.mkdir()
+        items, _ = manager.plan_exposures(self.lib, ["demo"], "project", str(project), "antigravity")
+        requirement, = items[0]["requirements"]
+        self.assertEqual(requirement["type"], "antigravity-workspace-directory")
+        self.assertEqual(requirement["target"], str(target.resolve()))
+        items, _ = manager.plan_exposures(self.lib, ["demo"], "project", str(self.root), "antigravity")
+        self.assertEqual(items[0]["requirements"], [])
+        items, _ = manager.plan_exposures(self.lib, ["demo"], "global", None, "antigravity")
+        self.assertEqual(items[0]["requirements"], [])
+        self.assertEqual(items[0]["link"], self.home / ".gemini" / "antigravity-cli" / "skills" / "demo")
+
     def test_discover_requires_openclaw_for_workspace_root(self) -> None:
         workspace = self.root / "agent-workspace"
         workspace.mkdir()
@@ -736,7 +773,7 @@ class SkillsManagerTests(unittest.TestCase):
         )
         self.lib.save_state(state)
 
-        for host in ("codex", "openclaw", "hermes"):
+        for host in ("codex", "openclaw", "hermes", "antigravity"):
             with self.subTest(host=host):
                 payload = self.capture_json(
                     manager.cmd_initialize_manager,
@@ -753,6 +790,11 @@ class SkillsManagerTests(unittest.TestCase):
                 self.assertEqual(payload["requested_host"], host)
                 self.assertFalse(native_link.exists())
         self.assertTrue(legacy_link.is_symlink())
+        status = self.capture_json(manager.cmd_status, Namespace())
+        self.assertEqual(
+            status["manager_host_exposure_status"]["antigravity"],
+            {"link": str(legacy_link), "status": "already-correct", "mode": "bootstrap"},
+        )
         state = self.lib.load_state()
         self.assertIn("skills-manager", state["skill_scopes"])
         self.assertNotIn("skills-manager", state["installations"])
@@ -1527,6 +1569,78 @@ class SkillsManagerTests(unittest.TestCase):
 
         self.assertTrue(link.is_symlink())
         self.assertEqual(manager.resolved(link), manager.resolved(target))
+
+    def test_explicit_shared_project_bindings_release_only_the_last_link(self) -> None:
+        skill = "shared-project"
+        target = self.create_skill(skill)
+        for first, second in (("codex", "antigravity"), ("antigravity", "codex")):
+            with self.subTest(first=first):
+                project = self.root / first
+                project.mkdir()
+                common = dict(skill=skill, scope="project", project=str(project))
+                first_args = Namespace(**common, host=first, apply=True)
+                second_args = Namespace(**common, host=second, apply=True)
+                self.capture_json(manager.cmd_expose, first_args)
+                link = project / ".agents" / "skills" / skill
+                with self.assertRaisesRegex(manager.ManagerError, "belongs to host"):
+                    manager.cmd_unexpose(second_args, self.lib)
+
+                before = self.lib.state_file.read_bytes()
+                preview = self.capture_json(
+                    manager.cmd_expose, Namespace(**common, host=second, apply=False)
+                )
+                self.assertEqual(preview["links"][0]["status"], "already-correct")
+                self.assertEqual(before, self.lib.state_file.read_bytes())
+                self.capture_json(manager.cmd_expose, second_args)
+                self.capture_json(manager.cmd_expose, second_args)
+                self.assertTrue(self.capture_json(manager.cmd_doctor, Namespace())["healthy"])
+                self.assertEqual(len(self.lib.load_state()["installations"][skill]), 2)
+
+                link.unlink()
+                self.capture_json(manager.cmd_repair, first_args)
+                self.assertEqual(link.resolve(), target.resolve())
+                result = self.capture_json(manager.cmd_unexpose, first_args)
+                self.assertEqual(result["remaining_hosts"], [second])
+                self.assertEqual(link.resolve(), target.resolve())
+                self.assertTrue(self.capture_json(manager.cmd_doctor, Namespace())["healthy"])
+                self.capture_json(manager.cmd_unexpose, second_args)
+                self.assertFalse(link.is_symlink())
+                self.assertTrue(target.is_dir())
+                self.assertNotIn(skill, self.lib.load_state()["installations"])
+
+    def test_shared_project_cannot_register_a_second_record_through_an_alias(self) -> None:
+        target = self.create_skill("shared-alias")
+        project = self.root / "project"
+        project.mkdir()
+        alias = self.root / "project-alias"
+        alias.symlink_to(project, target_is_directory=True)
+        args = dict(skill="shared-alias", scope="project", apply=True)
+        self.capture_json(manager.cmd_expose, Namespace(project=str(project), host="codex", **args))
+        before = self.lib.state_file.read_bytes()
+        for command in (manager.cmd_expose, manager.cmd_repair, manager.cmd_unexpose):
+            with self.subTest(command=command.__name__), self.assertRaisesRegex(
+                manager.ManagerError, "recorded project path"
+            ):
+                command(Namespace(project=str(alias), host="antigravity", **args), self.lib)
+        self.assertEqual(before, self.lib.state_file.read_bytes())
+        self.assertEqual((alias / ".agents" / "skills" / "shared-alias").resolve(), target.resolve())
+
+    def test_project_binding_cannot_overwrite_another_hosts_redirected_link(self) -> None:
+        self.create_skill("own-skill")
+        other = self.create_skill("other-skill")
+        project = self.root / "project"
+        project.mkdir()
+        common = dict(skill="own-skill", scope="project", project=str(project), apply=True)
+        self.capture_json(manager.cmd_expose, Namespace(host="codex", **common))
+        link = project / ".agents" / "skills" / "own-skill"
+        link.unlink()
+        link.symlink_to(other)
+        before = self.lib.state_file.read_bytes()
+        for command in (manager.cmd_expose, manager.cmd_repair, manager.cmd_unexpose):
+            with self.subTest(command=command.__name__), self.assertRaises(manager.ManagerError):
+                command(Namespace(host="antigravity", **common), self.lib)
+        self.assertEqual(link.resolve(), other.resolve())
+        self.assertEqual(before, self.lib.state_file.read_bytes())
 
     def test_legacy_unexpose_clears_last_legacy_scope_marker(self) -> None:
         target = self.create_skill("legacy-cleanup")

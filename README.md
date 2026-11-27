@@ -44,7 +44,7 @@ python3 scripts/skills_manager.py overlap set off --apply
 
 Skills Manager 管理独立 Skill，不负责插件或系统内置 Skill。它没有生命周期 Hook；标准 Agent 安装流程可以先将来源放入 staging，再交给 Skills Manager 检查，但直接调用底层安装脚本或手工复制文件可能绕过检查。
 
-当前实现使用通用的 `.agents/skills` 发现目录，并可在迁移时兼容读取 Codex Skill 目录。
+支持的宿主包括 Codex、Claude Code、OpenClaw、Hermes 和 Antigravity CLI。使用 `--host antigravity` 选择 Antigravity。全局入口位于 `~/.gemini/antigravity-cli/skills/`，项目入口与 Codex 共用 `.agents/skills/`。若项目链接指向工作区外，使用 `agy --add-dir <skill目录>` 加载管理器给出的目标目录。
 
 ## English
 
@@ -88,4 +88,4 @@ python3 scripts/skills_manager.py overlap set off --apply
 
 Skills Manager manages standalone Skills, not plugins or bundled system Skills. It has no lifecycle Hook. The standard Agent installation workflow can stage a source before handing it to Skills Manager, while direct low-level installer calls or manual filesystem copies may bypass the check.
 
-The current implementation uses the shared `.agents/skills` discovery convention and can read Codex-compatible Skill locations during migration.
+Supported hosts include Codex, Claude Code, OpenClaw, Hermes, and Antigravity CLI. Select Antigravity with `--host antigravity`. Global links live in `~/.gemini/antigravity-cli/skills/`. Project links share `.agents/skills/` with Codex. If a project link points outside the workspace, start `agy --add-dir <skill-directory>` with the target reported by Skills Manager.

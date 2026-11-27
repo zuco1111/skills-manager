@@ -19,9 +19,10 @@ import sys
 import tempfile
 import unicodedata
 import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -45,13 +46,14 @@ SCHEMA_VERSION = 1
 HOST_MODEL_VERSION = 2
 DEFAULT_LIBRARY = Path.home() / "SkillsLibrary"
 GLOBAL_SKILLS_DIR = Path.home() / ".agents" / "skills"
-SUPPORTED_HOSTS = ("codex", "claude-code", "openclaw", "hermes")
+SUPPORTED_HOSTS = ("codex", "claude-code", "openclaw", "hermes", "antigravity")
 SUPPORTED_SCOPES = {
     "legacy": {"global", "project"},
     "codex": {"global", "project"},
     "claude-code": {"global", "project"},
     "openclaw": {"global", "agent"},
     "hermes": {"global", "project"},
+    "antigravity": {"global", "project"},
 }
 OVERLAP_DEFAULTS = {"enabled": True, "initial_scan_done": False}
 CONTENT_IGNORE_DIRS = {".git", "__pycache__"}
@@ -585,6 +587,8 @@ def default_host_root(host: str) -> Path:
         return lexical_path(os.environ.get("OPENCLAW_STATE_DIR", str(Path.home() / ".openclaw")))
     if host == "hermes":
         return lexical_path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    if host == "antigravity":
+        return lexical_path(Path.home() / ".gemini" / "antigravity-cli")
     fail(f"Host {host!r} has no native root")
 
 
@@ -638,7 +642,7 @@ def validate_host_options(
     if scope not in SUPPORTED_SCOPES[host]:
         allowed = ", ".join(sorted(SUPPORTED_SCOPES[host]))
         fail(f"Scope {scope!r} is not valid for host {host!r}; choose {allowed}")
-    if project and not (scope == "project" and host in {"legacy", "codex", "claude-code", "hermes"}):
+    if project and scope != "project":
         fail("--project is valid only for a project scope")
     if workspace and not (host == "openclaw" and scope == "agent"):
         fail("--workspace is valid only for OpenClaw agent scope")
@@ -668,7 +672,7 @@ def scope_link(
             return GLOBAL_SKILLS_DIR / name, None
         project_root = lexical_path(project) if project else None
         suffix = Path(".agents") / "skills"
-    elif selected_host == "codex":
+    elif selected_host in {"codex", "antigravity"}:
         if scope == "global":
             return default_host_root(selected_host) / "skills" / name, None
         project_root = lexical_path(project) if project else None
@@ -746,6 +750,69 @@ def record_backup(state: dict[str, Any], path: Path, source: Path, kind: str) ->
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
     )
+
+
+SHARED_PROJECT_HOSTS = {"codex", "antigravity"}
+
+
+def project_link_owners(
+    state: dict[str, Any], link: Path, target: Path, skill: str, project: Path | None
+) -> set[str]:
+    """Read explicit owners of one Codex/Antigravity project link."""
+    if project is None or link != project / ".agents" / "skills" / skill:
+        return set()
+    # A directory alias must not acquire a separate record for the same on-disk link.
+    for recorded_path in state["exposures"]:
+        other = Path(recorded_path)
+        if other != link and other.name == skill and resolved(other.parent) == resolved(link.parent):
+            fail(f"Project link {link} is already recorded via {other}. Use its recorded project path.")
+    exposure = state["exposures"].get(str(link))
+    if exposure:
+        primary = exposure.get("host", "legacy")
+        if primary not in SHARED_PROJECT_HOSTS:
+            return set()
+        if (
+            exposure.get("skill") != skill or exposure.get("target") != str(target)
+            or exposure.get("project") != str(project) or exposure.get("scope") != "project"
+        ):
+            fail(f"Conflicting project exposure record at {link}")
+
+    owners = set()
+    for binding in state["installations"].get(skill, []):
+        if not isinstance(binding, dict) or binding.get("link") != str(link):
+            continue
+        if (
+            binding.get("host") not in SHARED_PROJECT_HOSTS
+            or binding.get("scope") != "project" or binding.get("project") != str(project)
+        ):
+            fail(f"Conflicting project installation record at {link}")
+        owners.add(binding["host"])
+    if exposure and owners and exposure["host"] not in owners:
+        fail(f"Project exposure at {link} has no installation record for {exposure['host']!r}")
+    return owners
+
+
+def check_binding_owner(
+    state: dict[str, Any], link: Path, target: Path, skill: str, host: str,
+    project: Path | None, status: str,
+) -> None:
+    owners = project_link_owners(state, link, target, skill, project)
+    exposure = state["exposures"].get(str(link))
+    if not exposure:
+        if owners and host not in owners:
+            fail(f"Repair the missing exposure at {link} for its recorded host first")
+        if (
+            project and host in SHARED_PROJECT_HOSTS and status != "create"
+            and state["skill_scopes"].get(skill) == "project"
+        ):
+            fail(f"Cannot classify unrecorded project link {link} while legacy project state exists")
+        return
+    primary = exposure.get("host", "legacy")
+    if host == primary or host in owners:
+        return
+    if owners and host in SHARED_PROJECT_HOSTS and status == "already-correct":
+        return
+    fail(f"Exposure record conflict at {link}: belongs to host {primary!r}")
 
 
 def record_exposure(
@@ -878,6 +945,14 @@ def exposure_requirements(item: dict[str, Any]) -> list[dict[str, str]]:
                 "note": "Trust this canonical Skill target before OpenClaw loads the workspace symlink.",
             }
         ]
+    if host == "antigravity" and scope == "project":
+        target = resolved(item["target"])
+        if not target.is_relative_to(resolved(item["context_root"])):
+            return [{
+                "type": "antigravity-workspace-directory",
+                "target": str(target),
+                "note": "Include this target in the CLI workspace with --add-dir if it is outside the current workspace roots.",
+            }]
     if host == "hermes" and scope == "project":
         return [
             {
@@ -997,12 +1072,7 @@ def plan_exposures(
         status = link_status(link, target)
         if status.startswith("conflict"):
             fail(f"Exposure conflict at {link}: {status}")
-        recorded = state["exposures"].get(str(link))
-        if recorded and recorded.get("host", "legacy") != selected_host:
-            fail(
-                f"Exposure record conflict at {link}: belongs to host "
-                f"{recorded.get('host', 'legacy')!r}; unexpose that binding first"
-            )
+        check_binding_owner(state, link, target, name, selected_host, this_project, status)
         context_root = this_project
         resolved_state_dir = (
             lexical_path(state_dir)
@@ -1060,6 +1130,7 @@ def skill_link_snapshot(
                 candidates[str(record["link"])] = True
 
     known_global_links = [GLOBAL_SKILLS_DIR / name]
+    known_global_links.extend(root / name for root in antigravity_shared_roots())
     for host in SUPPORTED_HOSTS:
         host_link, _ = scope_link(name, "global", None, host)
         known_global_links.append(host_link)
@@ -1210,6 +1281,7 @@ def cmd_status(args: argparse.Namespace, lib: Library) -> None:
     claude_link = manager_claude_link()
     claude_status = link_status(claude_link, canonical)
     bootstrap_modes = {
+        "antigravity": "bootstrap",
         "codex": "bootstrap",
         "openclaw": "bootstrap",
         "hermes": "bootstrap-external-directory",
@@ -1557,6 +1629,24 @@ def cmd_validate(args: argparse.Namespace, lib: Library) -> None:
         raise SystemExit(1)
 
 
+def antigravity_shared_roots() -> tuple[Path, Path]:
+    gemini = default_host_root("antigravity").parent
+    return gemini / "config" / "skills", gemini / "skills"
+
+
+def antigravity_packaged_skill(path: Path) -> bool:
+    cli = resolved(default_host_root("antigravity"))
+    gemini = cli.parent
+    packaged_roots = (
+        cli / "builtin", cli / "cache", cli / "plugins",
+        gemini / "config" / "plugins", gemini / "plugins",
+    )
+    return any(path.is_relative_to(root) for root in packaged_roots) or any(
+        parent.name == "plugins" and parent.parent.name in {".agents", ".agent", "_agents", "_agent"}
+        for parent in path.parents
+    )
+
+
 def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
     requested_hosts = getattr(args, "host", None) or []
     selected_hosts = sorted(set(requested_hosts)) if requested_hosts else list(SUPPORTED_HOSTS)
@@ -1569,16 +1659,26 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
     for host in selected_hosts:
         roots.append((f"{host}-global", default_host_root(host) / "skills"))
 
-    project_hosts = [host for host in selected_hosts if host != "openclaw"]
+    if "antigravity" in selected_hosts:
+        config_skills, shared_skills = antigravity_shared_roots()
+        roots.extend([
+            ("antigravity-global-config", config_skills),
+            ("antigravity-global-shared", shared_skills),
+        ])
+
+    project_hosts = [host for host in selected_hosts if "project" in SUPPORTED_SCOPES[host]]
     projects = getattr(args, "project", None) or []
     if projects and not project_hosts:
-        fail("--project requires codex, claude-code, or hermes in --host")
+        fail("--project requires a host supporting project scope")
     for project in projects:
         root = lexical_path(project)
         if not root.is_dir():
             fail(f"Project or module root does not exist: {root}")
         if "codex" in project_hosts:
             roots.append(("codex-project", root / ".agents" / "skills"))
+        if "antigravity" in project_hosts:
+            for directory in (".agents", ".agent", "_agents", "_agent"):
+                roots.append(("antigravity-project", root / directory / "skills"))
         if "claude-code" in project_hosts:
             roots.append(("claude-code-project", root / ".claude" / "skills"))
         if "hermes" in project_hosts:
@@ -1594,8 +1694,12 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
         roots.append(("openclaw-agent", root / "skills"))
 
     candidates: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    scopes_by_root: dict[Path, list[str]] = {}
     for scope, root in roots:
+        scopes = scopes_by_root.setdefault(root, [])
+        if scope not in scopes:
+            scopes.append(scope)
+    for root, scopes in scopes_by_root.items():
         if not root.is_dir():
             continue
         for child in sorted(root.iterdir(), key=lambda item: item.name):
@@ -1603,11 +1707,11 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
                 continue
             if child.absolute() == (GLOBAL_SKILLS_DIR / "skills-manager").absolute():
                 continue
-            key = str(child.absolute())
-            if key in seen or (not child.is_dir() and not child.is_symlink()):
+            if not child.is_dir() and not child.is_symlink():
                 continue
-            seen.add(key)
             target = resolved(child)
+            if antigravity_packaged_skill(target):
+                continue
             managed = target.parent == resolved(lib.skills)
             validation = validate_skill(target)
             candidates.append(
@@ -1615,7 +1719,8 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
                     "path": str(child),
                     "resolved_target": str(target),
                     "kind": "symlink" if child.is_symlink() else "directory",
-                    "scope": scope,
+                    "scope": scopes[0],
+                    "discovery_scopes": scopes,
                     "already_managed": managed,
                     "name": validation["name"],
                     "valid": validation["valid"],
@@ -1634,6 +1739,8 @@ def cmd_discover(args: argparse.Namespace, lib: Library) -> None:
 
 def cmd_adopt(args: argparse.Namespace, lib: Library) -> None:
     source = resolved(lexical_path(args.source))
+    if antigravity_packaged_skill(source):
+        fail(f"Antigravity manages this packaged Skill: {source}")
     validation = validate_skill(source, require_dir_name=False)
     if not validation["valid"]:
         fail(f"Source Skill is invalid: {validation['errors']}")
@@ -1873,14 +1980,8 @@ def cmd_repair(args: argparse.Namespace, lib: Library) -> None:
         fail(f"Refusing to repair a non-symlink path: {link}")
 
     state = lib.load_state()
-    recorded = state["exposures"].get(str(link))
-    if recorded and recorded.get("host", "legacy") != host:
-        fail(
-            f"Exposure record conflict at {link}: belongs to host "
-            f"{recorded.get('host', 'legacy')!r}"
-        )
-
     project_root = context_root if args.scope == "project" else None
+    check_binding_owner(state, link, target, name, host, project_root, status)
     workspace_root = context_root if host == "openclaw" and args.scope == "agent" else None
     state_root = (
         lexical_path(args.state_dir)
@@ -2119,6 +2220,8 @@ def migrate_core(
     additional_hosts: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     source = lexical_path(source)
+    if antigravity_packaged_skill(resolved(source)):
+        fail(f"Antigravity manages this packaged Skill: {source}")
     if source.is_symlink():
         fail("Migration source is a symlink; inspect and migrate its real target explicitly")
     validation = validate_skill(source, require_dir_name=False)
@@ -2524,21 +2627,42 @@ def cmd_unexpose(args: argparse.Namespace, lib: Library) -> None:
     state = lib.load_state()
     recorded_item = state["exposures"].get(str(link))
     recorded = recorded_item is not None
+    owners = project_link_owners(state, link, target, args.skill, project_root)
     if (
-        host == "codex"
-        and args.scope == "project"
-        and not recorded_item
-        and state["skill_scopes"].get(args.skill) == "project"
+        host in SHARED_PROJECT_HOSTS and args.scope == "project"
+        and not recorded and lexists(link)
     ):
-        fail(
-            f"Cannot prove Codex ownership of {link}; legacy project state exists. "
-            "Migrate or clear the legacy binding explicitly first"
-        )
-    if recorded_item and recorded_item.get("host", "legacy") != host:
+        label = "Codex" if host == "codex" else "Antigravity"
+        fail(f"Cannot prove {label} ownership of {link}; register the project link before unexposing it")
+    if not recorded_item and owners:
+        fail(f"Repair the missing exposure record at {link} before unexposing it")
+    if recorded_item and recorded_item.get("host", "legacy") != host and host not in owners:
         fail(
             f"Exposure at {link} belongs to host {recorded_item.get('host', 'legacy')!r}, "
             f"not {host!r}"
         )
+    remaining = owners - {host}
+    if remaining:
+        status = link_status(link, target)
+        if status.startswith("conflict"):
+            fail(f"Exposure conflict at {link}: {status}")
+        payload = {
+            "action": "unexpose",
+            "result": "retain-shared-exposure",
+            "apply": args.apply,
+            "skill": args.skill,
+            "host": host,
+            "scope": args.scope,
+            "link": str(link),
+            "link_status": status,
+            "remaining_hosts": sorted(remaining),
+        }
+        if args.apply:
+            remove_installation_for_link(state, args.skill, link, host)
+            state["exposures"][str(link)]["host"] = next(iter(remaining))
+            lib.save_state(state)
+        emit(payload)
+        return
     if not lexists(link):
         payload = {
             "action": "unexpose",
@@ -2628,6 +2752,9 @@ def cmd_remove(args: argparse.Namespace, lib: Library) -> None:
         host_link, _ = scope_link(name, "global", None, host)
         if link_status(host_link, target) == "already-correct":
             exposure_paths.add(str(host_link))
+    for root in antigravity_shared_roots():
+        if link_status(root / name, target) == "already-correct":
+            exposure_paths.add(str(root / name))
     installations = state["installations"].get(name, [])
     memberships = group_memberships(lib, name)
     if exposure_paths:
@@ -2995,6 +3122,15 @@ def cmd_doctor(args: argparse.Namespace, lib: Library) -> None:
                     }
                 )
             elif recorded_exposure.get("host", "legacy") != host:
+                try:
+                    owners = project_link_owners(
+                        state, Path(link_text), lib.skill_path(skill), skill,
+                        Path(record["project"]) if scope == "project" and record.get("project") else None,
+                    )
+                except ManagerError:
+                    owners = set()
+                if host in owners:
+                    continue
                 issues.append(
                     {
                         "type": "installation-exposure-host-mismatch",
@@ -3322,12 +3458,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+@contextmanager
+def library_write_lock(lib: Library) -> Iterator[None]:
+    """Serialize preflight, filesystem changes and state updates across CLI writers."""
+    lib.internal.mkdir(parents=True, exist_ok=True)
+    # state.json is atomically replaced, so its inode cannot be the lock.
+    with (lib.internal / "write.lock").open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args(normalize_cli_args(sys.argv[1:]))
     lib = Library(Path(args.library))
     try:
-        args.func(args, lib)
+        with (library_write_lock(lib) if getattr(args, "apply", False) else nullcontext()):
+            args.func(args, lib)
     except ManagerError as exc:
         emit({"error": str(exc), "command": args.command})
         return 2

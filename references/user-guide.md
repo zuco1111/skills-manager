@@ -17,7 +17,7 @@
 
 ## 1. Purpose and boundaries
 
-Skills Manager manages standalone agent Skills for Codex, Claude Code, OpenClaw, and Hermes. It keeps exactly one canonical copy of each managed Skill and creates host-specific directory symlinks so each agent sees only the installations relevant to it.
+Skills Manager manages standalone agent Skills for Codex, Claude Code, OpenClaw, Hermes, and Antigravity CLI. It keeps exactly one canonical copy of each managed Skill and creates host-specific directory symlinks at the selected host and scope.
 
 It is responsible for:
 
@@ -61,7 +61,7 @@ host discovery path/<skill-name>
 
 An installation consists of:
 
-- a host (`codex`, `claude-code`, `openclaw`, or `hermes`);
+- a host (`codex`, `claude-code`, `openclaw`, `hermes`, or `antigravity`);
 - a host-compatible scope;
 - an optional destination root;
 - the expected exposure path and its status.
@@ -89,6 +89,8 @@ Skills Manager does not initialize or modify Git during normal workflows.
 
 | Host | User-facing choice | CLI scope | Exposure path |
 |---|---|---|---|
+| Antigravity CLI | User-wide | `global` | `$HOME/.gemini/antigravity-cli/skills/<skill-name>` |
+| Antigravity CLI | Project/module | `project` | `<root>/.agents/skills/<skill-name>` |
 | Codex | User-wide | `global` | `${CODEX_HOME:-$HOME/.codex}/skills/<skill-name>` |
 | Codex | Project/module | `project` | `<root>/.agents/skills/<skill-name>` |
 | Claude Code | User-wide | `global` | `$HOME/.claude/skills/<skill-name>` |
@@ -103,7 +105,7 @@ Skills Manager does not initialize or modify Git during normal workflows.
 These combinations are intentionally rejected:
 
 - OpenClaw with `project` scope: use `agent` for an explicit OpenClaw installation, or rely on supported project discovery described below.
-- Codex, Claude Code, or Hermes with `agent` scope.
+- Codex, Claude Code, Hermes, or Antigravity CLI with `agent` scope.
 - Project scope without `--project` when creating a link now.
 - OpenClaw agent scope without `--workspace` when creating a link now.
 - Host-specific override flags on an unrelated host.
@@ -113,13 +115,14 @@ These combinations are intentionally rejected:
 Some host/scope combinations impose a runtime trust check in addition to filesystem exposure. The exposure dry run and apply result report these under `requirements`:
 
 - `openclaw-allow-symlink-target`: an OpenClaw agent-workspace link points outside the workspace to the canonical library. OpenClaw must allow or trust the exact canonical `target` reported by Skills Manager before it loads that symlink.
+- `antigravity-workspace-directory`: a project link whose canonical target is outside the project needs that target inside the CLI's active workspace roots. From the selected project, use `agy --add-dir <target>` when necessary. Repeat `--add-dir` for each required skill. Verify using `agy --add-dir <target> -p /skills` or the interactive `/skills` list. Global links work without this step.
 - `hermes-project-trust`: Hermes must trust the exact `project` reported by Skills Manager before it loads Skills from that project's `.hermes/skills/` directory.
 
 `skills_manager.py` creates and records symlinks; it does not automatically change OpenClaw allowlists, Hermes project trust, or other host configuration. Include every requirement in the displayed plan. After linking, complete the requirement through the host's supported trust mechanism and verify discovery before reporting the Skill as available. If the requirement is not completed, report two separate facts: the symlink was created, but runtime access remains pending.
 
 ### User-wide isolation
 
-User-wide entries are host-specific. Installing a Skill globally for Codex does not expose it globally to Claude Code, OpenClaw, or Hermes. Expose it separately when the user wants another host to see it.
+User-wide entries are host-specific. Installing a Skill globally for Codex does not expose it globally to other hosts. Expose it separately when the user wants another host to see it.
 
 There is no new user-wide installation target at `$HOME/.agents/skills` for ordinary Skills. The exact `$HOME/.agents/skills/skills-manager` bootstrap is the sole reserved exception. Omitting `--host` on ordinary exposure commands preserves legacy behavior only so existing installations can be inspected, repaired, unexposed, or migrated safely.
 
@@ -127,7 +130,9 @@ There is no new user-wide installation target at `$HOME/.agents/skills` for ordi
 
 A Codex project installation is placed in `.agents/skills`. When OpenClaw or Hermes operates in that same project, its runtime can also discover that entry after applicable trust, eligibility, and runtime checks. It can then invoke the Skill without a second Skills Manager registration.
 
-This does not create an OpenClaw or Hermes installation record: the explicit installation still belongs to Codex, while the other runtime is discovering a shared project entry. Skills Manager should neither duplicate the record nor create a blocking configuration.
+Antigravity CLI also reads this project path when the target is in its active workspace. If the user explicitly selects both Codex and Antigravity CLI, Skills Manager records both bindings to the same link. Releasing one binding keeps the link until the last binding is removed.
+
+Discovery alone does not create an OpenClaw, Hermes, or Antigravity installation record: the explicit installation still belongs to Codex, while the other runtime is discovering a shared project entry. Skills Manager should neither duplicate the record nor create a blocking configuration.
 
 Any runtime trust or eligibility needed for this cross-host discovery is still enforced by OpenClaw or Hermes. Skills Manager does not modify that runtime configuration automatically.
 
@@ -139,18 +144,19 @@ If OpenClaw uses another workspace, or Hermes is not running in that project, it
 
 When Skills Manager is running inside a recognized agent host, it uses that current host and asks only for choices the request has not already resolved:
 
+- Antigravity CLI (`agy`): CLI-wide or project-level?
 - Codex: user-wide or project-level?
 - Claude Code: user-wide or project-level?
 - OpenClaw: shared or one agent workspace?
 - Hermes: profile-wide or project-level?
 
-The user does not need to answer a four-host questionnaire for an ordinary installation. The script command still passes the resolved `--host` explicitly so a new operation cannot fall back to legacy behavior.
+The user does not need to answer a host-selection questionnaire for an ordinary installation. The script command still passes the resolved `--host` explicitly so a new operation cannot fall back to legacy behavior.
 
 If the user explicitly asks to install for another supported host, that target overrides the current host. If the user asks for multiple hosts, create one target plan per host and reuse the same canonical directory.
 
 ### Unknown or incompatible host
 
-If the current runtime cannot be identified, ask which of the four supported hosts should receive the installation before choosing scope or constructing a path. Do not guess from an existing directory.
+If the current runtime cannot be identified, ask which of the supported hosts should receive the installation before choosing scope or constructing a path. Do not guess from an existing directory.
 
 If the named host is unsupported or the requested scope is incompatible, explain the supported choices and stop before mutation. Do not fall back to `$HOME/.agents/skills` and do not silently treat an unknown host as Codex.
 
@@ -182,7 +188,7 @@ python3 scripts/skills_manager.py unset-scope <skill-name> \
 
 ## 5. Initialization and legacy migration
 
-### Shared bootstrap and optional Claude compatibility
+### Shared bootstrap and host compatibility links
 
 Initialization places or validates the canonical Skills Manager at:
 
@@ -208,6 +214,7 @@ python3 scripts/skills_manager.py initialize \
 When the dry run is conflict-free and matches the resolved request, immediately repeat it with `--apply` without asking for another confirmation. Initialization validates a staged copy before switching paths, preserves recoverable backups, preflights every requested entry, writes state once, and rolls back the canonical directory, backup move, and newly created links together on failure.
 
 - `--host codex`, `--host openclaw`, and `--host hermes` create no additional host-native manager link or installation record. They keep only the shared bootstrap.
+- Antigravity CLI reads the shared bootstrap directly. `initialize --host antigravity` verifies that link. Use `agy -p /skills` to check runtime discovery.
 - An explicit `--host claude-code` also creates `$HOME/.claude/skills/skills-manager` and records that Claude Code compatibility installation.
 - Initializing for another host never creates the Claude entry automatically. If Claude Code is detected and the compatibility link is absent, the result reports `claude_compatibility.offer: true`. Ask whether the user wants the entry; only after agreement should you dry-run `initialize --host claude-code`, then apply it immediately when the preflight is conflict-free.
 
@@ -227,6 +234,9 @@ Relevant roots include:
 
 ```text
 ${CODEX_HOME:-$HOME/.codex}/skills
+$HOME/.gemini/antigravity-cli/skills          # Antigravity CLI installation target
+$HOME/.gemini/config/skills                  # also discoverable by Antigravity App
+$HOME/.gemini/skills                         # Gemini shared source
 $HOME/.claude/skills
 ${OPENCLAW_STATE_DIR:-$HOME/.openclaw}/skills
 ${HERMES_HOME:-$HOME/.hermes}/skills
@@ -236,6 +246,8 @@ $HOME/.agents/skills                         # ordinary legacy compatibility sou
 <supplied-project>/.hermes/skills
 <supplied-openclaw-workspace>/skills
 ```
+
+For Antigravity, discovery also checks the documented project aliases `.agent`, `_agent`, and `_agents` in supplied roots. Check existing consumers before moving a shared source into the CLI-only directory. When the original must keep serving other consumers, adopt its content and expose the canonical Skill for the CLI, leaving the shared source in place. Verify active Skills in the CLI with `/skills`. See [Google’s discovery reference](https://antigravity.google/docs/customization-discovery/).
 
 Do not scan arbitrary home or filesystem trees. Exclude `.system`, plugin caches, bundled Skills, administrator-managed entries, and the exact reserved `$HOME/.agents/skills/skills-manager` bootstrap by default.
 
@@ -283,7 +295,7 @@ The normal sequence is:
 7. Apply a conflict-free adoption dry run immediately, then validate the canonical copy. For replacement, the user's explicit **use incoming** choice authorizes the matching conflict-free `--replace` plan without another confirmation. Skip this canonical mutation when reusing existing content.
 8. Dry-run the host-specific exposure and inspect every returned runtime requirement, or record a canonical-only host/scope installation when no destination exists.
 9. Apply the exposure immediately when its dry run is conflict-free and matches the resolved target. Report its runtime requirements; ask only if satisfying one requires a new user decision or authorization.
-10. Satisfy and verify any OpenClaw target allowlist or Hermes project trust requirement before reporting the Skill as available.
+10. Satisfy and verify any reported runtime requirements before reporting the Skill as available.
 
 This sequence applies to ordinary Skills. Installing Skills Manager itself uses the initialization exception in section 5 rather than generic `adopt`, `expose`, or `migrate` commands.
 
@@ -297,6 +309,10 @@ python3 scripts/skills_manager.py expose example \
 # Codex project
 python3 scripts/skills_manager.py expose example \
   --host codex --scope project --project /work/payments
+
+# Antigravity CLI global or project (choose the intended scope)
+python3 scripts/skills_manager.py expose example --host antigravity --scope global
+python3 scripts/skills_manager.py expose example --host antigravity --scope project --project /work/payments
 
 # Claude Code project
 python3 scripts/skills_manager.py expose example \
@@ -321,7 +337,7 @@ python3 scripts/skills_manager.py expose example \
 
 Use `--state-dir` or `--profile-home` only when the user selected a non-default OpenClaw or Hermes root. Mutating commands remain dry-runs until `--apply` is added; the agent adds it immediately after a conflict-free preflight that matches the resolved request.
 
-For OpenClaw agent exposure, the output includes `openclaw-allow-symlink-target` with the canonical target that OpenClaw must trust. For Hermes project exposure, it includes `hermes-project-trust` with the project root Hermes must trust. These are post-link runtime prerequisites, not configuration changes performed by the script.
+For OpenClaw agent exposure, the output includes `openclaw-allow-symlink-target` with the canonical target that OpenClaw must trust. For Hermes project exposure, it includes `hermes-project-trust` with the project root Hermes must trust. For Antigravity CLI, it reports the workspace requirement for external project targets. These are post-link runtime prerequisites, not configuration changes performed by the script.
 
 If a canonical name already exists, compare the incoming directory with the canonical content before deciding anything. The deterministic fingerprint includes relative paths, empty directories, regular-file bytes, symlink targets, and executable bits. It ignores entries named `.git` or `__pycache__`, files named `.DS_Store`, and files ending in `.pyc`.
 
@@ -435,7 +451,7 @@ If replacement fails before commit, restore the old canonical directory. If only
 
 ### Unexposure and scope changes
 
-Unexposure removes only the selected host/scope link and its exposure record. It never removes the canonical target or another host's installation. The reserved Skills Manager bootstrap cannot be unexposed; only its optional Claude Code compatibility link can be removed this way.
+Unexposure removes the selected host/scope registration. A shared project link is removed with its last explicit registration. It never removes the canonical target or another host's installation. The reserved Skills Manager bootstrap cannot be unexposed; only its optional Claude Code compatibility link can be removed this way.
 
 `unset-scope <skill>... --host <host> --scope <scope>` removes only canonical-only installations with `link: null`. It is dry-run by default; repeat it immediately with `--apply` when the result is conflict-free and matches the request. If the installation has a link, `unset-scope` refuses it and the link must be handled with `unexpose`.
 
@@ -473,7 +489,7 @@ Do not force unrelated doctor issues through link repair. Use initialization for
 - When a dry run succeeds, matches the resolved request, and reports no conflict or unresolved decision, immediately repeat it with `--apply` without displaying a confirmation prompt.
 - Ask only when preflight exposes a conflict or overwrite resolution, version or overlap choice, ambiguous host, scope, root, target, or batch selection, missing authorization or runtime trust, or another issue the user must decide. Once the user resolves it, rerun any affected preflight and apply a matching conflict-free result without asking again.
 - Consent to scan for migration is not consent to mutate. Obtain the user's selected items and explicit host/scope mappings, then preflight and automatically apply each conflict-free matching plan.
-- The script reports OpenClaw and Hermes runtime trust requirements but does not edit their configuration; link creation alone is not proof of runtime availability.
+- The script reports OpenClaw, Hermes, and Antigravity CLI runtime requirements but does not edit their configuration; link creation alone is not proof of runtime availability.
 - Canonical candidates are staged and validated before promotion.
 - State and group files are written atomically.
 - Conflicting paths stop the affected operation.
@@ -625,14 +641,14 @@ Skills Manager: I will keep the canonical copy, record a Hermes project installa
 ### Migrate a legacy entry
 
 ```text
-Skills Manager: This Skill is marked legacy global, which does not identify a host. Should it become Codex user-wide, Claude Code user-wide, OpenClaw shared, Hermes profile-wide, or remain legacy?
+Skills Manager: This Skill is marked legacy global, which does not identify a host. Should it become Codex user-wide, Claude Code user-wide, OpenClaw shared, Hermes profile-wide, Antigravity CLI user-wide, or remain legacy?
 ```
 
 The selected mapping is dry-run and applied immediately when the result is conflict-free. The mapping choice itself is not reconfirmed.
 
 ## 12. Current limitations
 
-- Only Codex, Claude Code, OpenClaw, and Hermes have explicit host adapters.
+- Only Codex, Claude Code, OpenClaw, Hermes, and Antigravity CLI have explicit host adapters.
 - Runtime discovery can still depend on client version, trust, eligibility, and workspace configuration.
 - There is no Hook-based interception of external installation or overlap-check bypasses.
 - Plugins, bundled system Skills, administrator Skills, and plugin caches are not managed.
